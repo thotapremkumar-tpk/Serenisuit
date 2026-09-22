@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="SereniSuit BT">
+<meta name="theme-color" content="#0f172a">
+<title>SereniSuit · Bluetooth</title>
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icon-192.png">
+<!--
+  SereniSuit — Bluetooth dashboard.
+  Same screen as the Wi-Fi dashboard the suit serves itself, but it talks to
+  the suit over Bluetooth LE (Web Bluetooth), so this device does not have to
+  join the suit's Wi-Fi.
+
+  Works in: Chrome or Edge on Mac / Windows / Linux / Android.
+  Not in:   iPhone / iPad browsers (Apple has no Web Bluetooth) -> use the
+            Wi-Fi dashboard there, or the Bluefy app.
+  Must be opened from https:// (e.g. GitHub Pages) or http://localhost.
+-->
+<style>
+  :root{
+    --bg:#0f172a; --card:#182338; --line:#2a3752;
+    --text:#e7ecf5; --muted:#93a1bd;
+    --ok:#37c975; --warn:#f5b942; --danger:#ff5470; --off:#5b6b8c; --accent:#4fa8ff;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
+  body{padding:16px;padding-top:max(16px,env(safe-area-inset-top));max-width:560px;margin:0 auto;padding-bottom:56px;}
+  h1{font-size:20px;margin:6px 0 2px;}
+  .sub{color:var(--muted);font-size:13px;margin-bottom:16px;}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px 18px;margin-bottom:12px;}
+  .label{font-size:14px;font-weight:600;}
+  .hint{color:var(--muted);font-size:12px;margin-top:4px;line-height:1.4;}
+  .row{display:flex;align-items:center;justify-content:space-between;gap:12px;}
+  .row + .row{margin-top:14px;}
+
+  /* pairing */
+  .pair-head{display:flex;align-items:center;gap:10px;font-weight:600;font-size:15px;}
+  .pair-dot{width:10px;height:10px;border-radius:50%;background:var(--warn);flex:none;}
+  .pair.ok .pair-dot{background:var(--ok);box-shadow:0 0 0 4px rgba(55,201,117,.18);}
+  .pair.bad .pair-dot{background:var(--danger);}
+  .pair.ok{border-color:rgba(55,201,117,.45);}
+  .devices{list-style:none;margin:10px 0 0;padding:0;}
+  .devices li{display:flex;align-items:center;gap:8px;font-size:13px;padding:6px 0;border-top:1px solid var(--line);}
+  .devices li:first-child{border-top:none;}
+  .me{color:var(--accent);font-size:11px;margin-left:auto;}
+  .bt-mark{display:inline-flex;align-items:center;gap:6px;}
+
+  /* reading */
+  .top{display:flex;justify-content:space-between;align-items:center;min-height:20px;}
+  .bpm-row{display:flex;align-items:baseline;gap:10px;justify-content:center;margin-top:6px;}
+  .bpm{font-size:68px;font-weight:700;line-height:1;font-variant-numeric:tabular-nums;}
+  .bpm-unit{color:var(--muted);font-size:16px;}
+  .status-wrap{text-align:center;margin-top:10px;}
+  .status{font-weight:700;letter-spacing:.05em;padding:8px 16px;border-radius:999px;display:inline-block;font-size:13px;}
+  .status.normal{background:rgba(55,201,117,.15);color:var(--ok);}
+  .status.danger{background:rgba(255,84,112,.18);color:var(--danger);animation:pulse 1s infinite;}
+  .status.off{background:rgba(91,107,140,.2);color:var(--muted);}
+  .status.wait{background:rgba(79,168,255,.15);color:var(--accent);}
+  @keyframes pulse{0%,100%{opacity:1;}50%{opacity:.5;}}
+  .pill{font-size:11px;padding:3px 9px;border-radius:999px;background:rgba(245,185,66,.15);color:var(--warn);font-weight:600;}
+  .pill.bt{background:rgba(79,168,255,.15);color:var(--accent);}
+
+  /* controls */
+  .switch{position:relative;width:50px;height:28px;flex:none;}
+  .switch input{opacity:0;width:0;height:0;}
+  .slider{position:absolute;inset:0;background:var(--off);border-radius:999px;cursor:pointer;transition:.15s;}
+  .slider:before{content:"";position:absolute;width:22px;height:22px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.15s;}
+  .switch input:checked + .slider{background:var(--ok);}
+  .switch input:checked + .slider:before{transform:translateX(22px);}
+  .switch input:disabled + .slider{opacity:.4;cursor:not-allowed;}
+  input[type=number]{width:100%;padding:10px 12px;border-radius:10px;border:1px solid var(--line);
+    background:#0d1626;color:var(--text);font-size:15px;}
+  button{border:none;border-radius:10px;padding:10px 14px;font-size:14px;font-weight:600;cursor:pointer;
+    font-family:inherit;}
+  button:active{transform:scale(.98);}
+  button:disabled{opacity:.45;cursor:not-allowed;transform:none;}
+  .btn-primary{background:var(--accent);color:#06111f;}
+  .btn-ghost{background:transparent;color:var(--text);border:1px solid var(--line);}
+  .btn-on{background:rgba(55,201,117,.15);color:var(--ok);border:1px solid rgba(55,201,117,.45);}
+  .quick{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:12px;}
+  .quick button{padding:10px 6px;line-height:1.25;}
+  .quick small{display:block;font-weight:500;font-size:11px;opacity:.8;}
+  .q-ok{background:rgba(55,201,117,.14);color:var(--ok);}
+  .q-bad{background:rgba(255,84,112,.14);color:var(--danger);}
+  .custom{display:flex;gap:8px;margin-top:10px;}
+  .custom button{flex:none;}
+  .full{width:100%;margin-top:10px;}
+  .notice{background:rgba(245,185,66,.1);border:1px solid rgba(245,185,66,.35);color:var(--text);
+    border-radius:12px;padding:12px 14px;font-size:13px;line-height:1.5;margin-top:10px;}
+
+  /* info */
+  .info dl{display:grid;grid-template-columns:auto 1fr;gap:6px 12px;margin:8px 0 0;font-size:13px;}
+  .info dt{color:var(--muted);}
+  .info dd{margin:0;word-break:break-word;}
+  details{margin-top:10px;font-size:13px;color:var(--muted);}
+  summary{cursor:pointer;color:var(--accent);}
+  details ol{padding-left:18px;margin:8px 0 0;line-height:1.6;}
+
+  /* alerts */
+  .banner{position:fixed;left:0;right:0;top:0;z-index:20;background:var(--danger);color:#fff;
+    text-align:center;font-weight:700;padding:12px 16px;padding-top:max(12px,env(safe-area-inset-top));
+    transform:translateY(-110%);transition:transform .2s;}
+  .banner.show{transform:none;}
+  body.banner-on{padding-top:calc(64px + env(safe-area-inset-top));}
+  .toasts{position:fixed;left:0;right:0;bottom:16px;z-index:30;display:flex;flex-direction:column;
+    align-items:center;gap:8px;pointer-events:none;padding:0 16px;}
+  .toast{background:#e7ecf5;color:#0f172a;border-radius:12px;padding:10px 14px;font-size:14px;font-weight:600;
+    box-shadow:0 6px 24px rgba(0,0,0,.35);max-width:520px;width:100%;opacity:0;transform:translateY(8px);
+    transition:opacity .2s,transform .2s;}
+  .toast.show{opacity:1;transform:none;}
+  .toast.danger{background:var(--danger);color:#fff;}
+  .toast.ok{background:var(--ok);color:#06111f;}
+</style>
+</head>
+<body>
+  <div class="banner" id="banner"></div>
+
+  <h1>SereniSuit</h1>
+  <div class="sub">Live heart rate over Bluetooth · from the suit's ECG (AD8232)</div>
+
+  <div class="card pair" id="pairCard">
+    <div class="pair-head"><span class="pair-dot"></span><span id="pairTitle">Not connected</span></div>
+    <div class="hint" id="pairSub">Tap Connect, then pick "SereniSuit" from the list.</div>
+    <button class="btn-primary full" id="connectBtn">Connect via Bluetooth</button>
+    <div class="notice" id="unsupported" style="display:none;"></div>
+    <ul class="devices" id="deviceList"></ul>
+  </div>
+
+  <div class="card">
+    <div class="top">
+      <span class="pill" id="demoPill" style="display:none;">DEMO INPUT</span>
+      <span class="pill bt">BLUETOOTH</span>
+    </div>
+    <div class="bpm-row">
+      <span class="bpm" id="bpmValue">--</span>
+      <span class="bpm-unit">BPM</span>
+    </div>
+    <div class="status-wrap"><span class="status off" id="statusBadge">NOT CONNECTED</span></div>
+    <div class="hint" id="shapeLine" style="display:none;text-align:center;margin-top:8px;"></div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <div class="label">Sensors</div>
+        <div class="hint">Switch the suit's ECG sensor (AD8232) on or off.</div>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="sensorsToggle" checked disabled>
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="row">
+      <div>
+        <div class="label">Alerts on this device</div>
+        <div class="hint" id="alertHint">Tap to allow sound and vibration after every BPM check.</div>
+      </div>
+      <button class="btn-ghost" id="alertBtn">Enable</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="label">Demo — fake BPM input</div>
+    <div class="hint">Drives the suit exactly like a real reading. 60–100 is normal and is just shown.
+      Outside that range the suit shows DANGER and vibrates.</div>
+    <div class="quick">
+      <button class="q-ok"  data-bpm="72">72<small>normal</small></button>
+      <button class="q-bad" data-bpm="45">45<small>too low</small></button>
+      <button class="q-bad" data-bpm="140">140<small>too high</small></button>
+    </div>
+    <div class="custom">
+      <input type="number" id="demoBpmInput" placeholder="Any BPM, e.g. 110" inputmode="numeric" min="1" max="300">
+      <button class="btn-primary" id="sendDemoBtn">Send</button>
+    </div>
+    <button class="btn-ghost full" id="clearDemoBtn">Back to live sensor</button>
+  </div>
+
+  <div class="card info">
+    <div class="label">Suit</div>
+    <dl>
+      <dt>Bluetooth</dt><dd id="iBt">—</dd>
+      <dt>Wi-Fi</dt><dd id="iNet">—</dd>
+      <dt>ECG sensor</dt><dd id="iSensor">—</dd>
+      <dt>Screen</dt><dd id="iOled">—</dd>
+      <dt>On-chip ML</dt><dd id="iMl">—</dd>
+    </dl>
+    <details>
+      <summary>Install as an app on your phone</summary>
+      <ol>
+        <li>Open this page once in Chrome on the phone (it is saved for offline use).</li>
+        <li>Chrome menu ⋮ → <b>Add to Home screen</b> / <b>Install app</b>.</li>
+        <li>Open SereniSuit BT from the icon and tap <b>Connect via Bluetooth</b>.</li>
+        <li>No need to join the suit's Wi-Fi — Bluetooth is enough.</li>
+      </ol>
+    </details>
+  </div>
+
+  <div class="toasts" id="toasts"></div>
+
+<script>
+(function(){
+  /* must match the firmware (src/main.cpp) */
+  var SVC      = '5e7e5000-24e2-498b-a477-c675190a743e';
+  var CH_STATE = '5e7e5001-24e2-498b-a477-c675190a743e';
+  var CH_DEV   = '5e7e5002-24e2-498b-a477-c675190a743e';
+  var CH_CMD   = '5e7e5003-24e2-498b-a477-c675190a743e';
+  var CH_INFO  = '5e7e5004-24e2-498b-a477-c675190a743e';
+
+  var $ = function(id){ return document.getElementById(id); };
+  var bpmEl = $('bpmValue'), statusEl = $('statusBadge'), demoPill = $('demoPill');
+  var pairCard = $('pairCard'), pairTitle = $('pairTitle'), pairSub = $('pairSub'), deviceList = $('deviceList');
+  var connectBtn = $('connectBtn'), sensorsToggle = $('sensorsToggle');
+  var alertBtn = $('alertBtn'), alertHint = $('alertHint'), demoInput = $('demoBpmInput'), banner = $('banner');
+
+  var dec = new TextDecoder(), enc = new TextEncoder();
+  var device = null, chState = null, chDev = null, chCmd = null, chInfo = null;
+  var link = 'idle';                 // idle | connecting | connected | lost
+  var userClosed = false, retries = 0, retryTimer = null;
+  var token = Math.random().toString(36).slice(2, 8);   // lets this page find itself in the paired list
+  var myLabel = deviceLabel();
+  var devices = [], known = null;
+  var lastState = null, lastCheckSeq = null;
+  var alertsOn = false, audioCtx = null, toggleBusyUntil = 0;
+  var unsupported = '';              // set when this browser can't do Web Bluetooth
+
+  /* ---------- who am I ---------- */
+  function deviceLabel(){
+    var ua = navigator.userAgent || '';
+    var mobile = /Android|iPhone|iPad|iPod|Mobile/i.test(ua);
+    var standalone = (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) ||
+                     window.navigator.standalone === true;
+    var os = /Android/i.test(ua) ? 'Android' : /iPhone|iPad|iPod/i.test(ua) ? 'iPhone' :
+             /Mac/i.test(ua) ? 'Mac' : /Windows/i.test(ua) ? 'Windows' : /Linux/i.test(ua) ? 'Linux' : '';
+    var kind = mobile ? (standalone ? 'Mobile app' : 'Mobile browser') : 'Website';
+    return os ? kind + ' (' + os + ')' : kind;
+  }
+  function isMobileLabel(l){ return /^Mobile/.test(l); }
+
+  /* ---------- small UI helpers ---------- */
+  function toast(text, kind){
+    var t = document.createElement('div');
+    t.className = 'toast' + (kind ? ' ' + kind : '');
+    t.textContent = text;
+    $('toasts').appendChild(t);
+    requestAnimationFrame(function(){ t.classList.add('show'); });
+    setTimeout(function(){ t.classList.remove('show'); setTimeout(function(){ t.remove(); }, 250); }, 3500);
+  }
+
+  var STATUS = {
+    normal:       {text:'NORMAL',         cls:'normal'},
+    danger:       {text:'DANGER',         cls:'danger'},
+    sensors_off:  {text:'SENSORS OFF',    cls:'off'},
+    sensor_error: {text:'NO ECG SIGNAL',     cls:'off'},
+    leads_off:    {text:'ATTACH ELECTRODES', cls:'wait'},
+    reading:      {text:'READING…',       cls:'wait'},
+    booting:      {text:'STARTING…',      cls:'wait'}
+  };
+
+  /* ---------- Bluetooth plumbing ----------
+   * Chrome allows one GATT operation at a time, so every read/write/subscribe
+   * goes through this queue. */
+  var queue = Promise.resolve();
+  function gatt(op){
+    var p = queue.then(op);
+    queue = p.catch(function(){});
+    return p;
+  }
+  function readJSON(ch){
+    return gatt(function(){ return ch.readValue(); }).then(function(dv){ return JSON.parse(dec.decode(dv)); });
+  }
+  function send(obj){
+    if (link !== 'connected' || !chCmd) return Promise.reject(new Error('not connected'));
+    var data = enc.encode(JSON.stringify(obj));
+    return gatt(function(){
+      return chCmd.writeValueWithResponse ? chCmd.writeValueWithResponse(data) : chCmd.writeValue(data);
+    });
+  }
+  function command(obj){
+    return send(obj).catch(function(){ toast('Not connected to the suit — tap Connect via Bluetooth', 'danger'); });
+  }
+  function sendHello(){
+    if (link === 'connected') send({type: 'hello', device: myLabel, token: token}).catch(function(){});
+  }
+
+  function unsupportedReason(){
+    if (!window.isSecureContext) return 'Bluetooth needs a secure page. Open this app from its https:// link ' +
+      '(e.g. GitHub Pages) or from http://localhost — not as a plain http:// address.';
+    if (!navigator.bluetooth) {
+      var ios = /iPhone|iPad|iPod/i.test(navigator.userAgent || '');
+      return ios ? 'iPhone and iPad browsers cannot use Bluetooth from a web page. Use the Wi-Fi dashboard ' +
+                   '(join SereniSuit-Demo, open http://192.168.4.1) — or the Bluefy app.'
+                 : 'This browser cannot use Bluetooth from a web page. Use Chrome or Edge, or the Wi-Fi dashboard ' +
+                   '(join SereniSuit-Demo, open http://192.168.4.1).';
+    }
+    return '';
+  }
+
+  connectBtn.addEventListener('click', function(){
+    var why = unsupportedReason();
+    if (why) { showUnsupported(why); return; }
+    userClosed = false;
+    if (device && link === 'lost') {                  // same suit as before: no need to pick it again
+      retries = 0;
+      connectGatt().catch(function(e){ toast('Bluetooth: ' + (e && e.message ? e.message : e), 'danger'); });
+      return;
+    }
+    navigator.bluetooth.requestDevice({
+      filters: [{services: [SVC]}, {namePrefix: 'SereniSuit'}],
+      optionalServices: [SVC]
+    }).then(function(d){
+      if (device && device !== d) device.removeEventListener('gattserverdisconnected', onLinkLost);
+      device = d;
+      device.addEventListener('gattserverdisconnected', onLinkLost);
+      return connectGatt();
+    }).catch(function(e){
+      if (e && e.name === 'NotFoundError') return;          // chooser closed
+      toast('Bluetooth: ' + (e && e.message ? e.message : e), 'danger');
+    });
+  });
+
+  function connectGatt(){
+    link = 'connecting'; render();
+    return device.gatt.connect()
+      .then(function(server){ return server.getPrimaryService(SVC); })
+      .then(function(svc){
+        return Promise.all([svc.getCharacteristic(CH_STATE), svc.getCharacteristic(CH_DEV),
+                            svc.getCharacteristic(CH_CMD),   svc.getCharacteristic(CH_INFO)]);
+      })
+      .then(function(c){
+        chState = c[0]; chDev = c[1]; chCmd = c[2]; chInfo = c[3];
+        chState.oncharacteristicvaluechanged = function(e){
+          try { onState(JSON.parse(dec.decode(e.target.value))); } catch (err) {}
+        };
+        chDev.oncharacteristicvaluechanged = function(){
+          readJSON(chDev).then(onDevices).catch(function(){});   // full list, even if long
+        };
+        return gatt(function(){ return chState.startNotifications(); })
+          .then(function(){ return gatt(function(){ return chDev.startNotifications(); }); });
+      })
+      .then(function(){
+        link = 'connected'; retries = 0; render();
+        sendHello();
+        return readJSON(chState).then(onState)
+          .then(function(){ return readJSON(chDev).then(onDevices); })
+          .then(function(){ return readJSON(chInfo).then(showInfo); });
+      })
+      .catch(function(e){
+        if (link !== 'connected') { onLinkLost(); }
+        throw e;
+      });
+  }
+
+  function onLinkLost(){
+    if (link === 'lost' && retryTimer) return;
+    var was = link === 'connected';
+    link = 'lost'; known = null; devices = [];
+    clearTimeout(retryTimer); retryTimer = null;
+    if (!userClosed && device && retries < 8) {       // try again by itself, backing off
+      var wait = Math.min(1500 * Math.pow(1.5, retries++), 8000);
+      retryTimer = setTimeout(function(){
+        retryTimer = null;
+        connectGatt().catch(function(){});
+      }, wait);
+    }
+    if (was) toast('Bluetooth link to the suit lost — reconnecting…', 'danger');
+    render();
+  }
+
+  /* ---------- incoming data ---------- */
+  function onState(b){
+    // short keys from the suit: s status, b bpm, so sensors on, da demo active, q check number, n paired
+    applyState({status: b.s, bpm: b.b, sensorsOn: !!b.so, demoActive: !!b.da, checkSeq: b.q, paired: b.n,
+                shape: (b.sh === undefined ? -1 : b.sh), shapeN: b.sn || 0});
+  }
+  function onDevices(list){
+    devices = (list || []).map(function(e){ return {id: e[0], label: e[1], via: e[2], token: e[3]}; });
+    render();
+  }
+  function showInfo(i){
+    $('iBt').textContent = (i.bluetooth || 'SereniSuit') + ' (connected)';
+    $('iNet').textContent = i.network + (i.ownNet ? ' · http://' + i.ip : ' · http://' + i.ip);
+    $('iSensor').textContent = (i.sensor || 'AD8232 ECG') + ' · OUTPUT→5, LO+→6, LO−→7';
+    $('iOled').textContent = i.oled || '—';
+    $('iMl').textContent = i.mlCorrect + '/' + i.mlTotal + ' test beats correct · ' + i.mlUs + ' µs each · ' + i.mlKb + ' KB model (PTB ECG)';
+  }
+
+  /* ---------- rendering ---------- */
+  function render(){
+    var mine = devices.some(function(d){ return d.token === token; });
+    var connected = link === 'connected';
+
+    pairCard.classList.remove('ok', 'bad');
+    connectBtn.style.display = (unsupported || connected || link === 'connecting' || (link === 'lost' && retryTimer)) ? 'none' : 'block';
+    connectBtn.textContent = link === 'lost' ? 'Reconnect via Bluetooth' : 'Connect via Bluetooth';
+    [sensorsToggle].concat(Array.prototype.slice.call(document.querySelectorAll('.quick button, #sendDemoBtn, #clearDemoBtn')))
+      .forEach(function(el){ el.disabled = !connected; });
+
+    if (link === 'idle') {
+      pairTitle.textContent = unsupported ? 'Bluetooth not available here' : 'Not connected';
+      pairSub.textContent = unsupported ? '' : 'Tap Connect, then pick "SereniSuit" from the list.';
+    } else if (link === 'connecting') {
+      pairTitle.textContent = 'Connecting to SereniSuit…';
+      pairSub.textContent = 'Over Bluetooth';
+    } else if (link === 'lost') {
+      pairCard.classList.add('bad');
+      pairTitle.textContent = 'Bluetooth link lost';
+      pairSub.textContent = retryTimer ? 'Reconnecting… keep this device within a few metres of the suit.'
+                                       : 'Tap Reconnect. Is the suit switched on and nearby?';
+      bpmEl.textContent = '--';
+      statusEl.textContent = 'NOT CONNECTED'; statusEl.className = 'status off';
+      banner.classList.remove('show'); document.body.classList.remove('banner-on');
+    } else if (mine) {
+      pairCard.classList.add('ok');
+      pairTitle.textContent = 'Paired with SereniSuit ✓';
+      pairSub.textContent = devices.length + (devices.length === 1 ? ' device' : ' devices') + ' connected right now';
+    } else {
+      pairTitle.textContent = 'Pairing with SereniSuit…';
+      pairSub.textContent = 'Connected over Bluetooth — finishing pairing';
+    }
+
+    deviceList.innerHTML = '';
+    if (connected) devices.forEach(function(d){
+      var li = document.createElement('li');
+      var icon = document.createElement('span');
+      icon.textContent = isMobileLabel(d.label) ? '📱' : '💻';
+      var name = document.createElement('span');
+      name.textContent = d.label + (d.via === 'bt' ? ' · Bluetooth' : ' · Wi-Fi');
+      li.appendChild(icon); li.appendChild(name);
+      if (d.token === token) {
+        var me = document.createElement('span');
+        me.className = 'me'; me.textContent = 'this device';
+        li.appendChild(me);
+      }
+      deviceList.appendChild(li);
+    });
+
+    /* pop-ups when another device pairs or leaves */
+    var now = {};
+    devices.forEach(function(d){ now[d.id] = d; });
+    if (known !== null && mine) {
+      Object.keys(now).forEach(function(id){
+        if (!(id in known) && now[id].token !== token)
+          toast((isMobileLabel(now[id].label) ? '📱 ' : '💻 ') + now[id].label +
+                (now[id].via === 'bt' ? ' · Bluetooth' : ' · Wi-Fi') + ' paired', 'ok');
+      });
+      Object.keys(known).forEach(function(id){
+        if (!(id in now) && known[id].token !== token) toast(known[id].label + ' disconnected');
+      });
+    }
+    if (connected && mine) {
+      if (known === null) toast('Paired with SereniSuit ✓', 'ok');
+      known = now;
+    }
+  }
+
+  function applyState(s){
+    lastState = s;
+    bpmEl.textContent = (s.bpm > 0 && (s.status === 'normal' || s.status === 'danger')) ? s.bpm : '--';
+    var m = STATUS[s.status] || {text: String(s.status || '').toUpperCase(), cls: 'wait'};
+    statusEl.textContent = m.text;
+    statusEl.className = 'status ' + m.cls;
+    demoPill.style.display = s.demoActive ? 'inline-block' : 'none';
+    var shapeLine = $('shapeLine');
+    if (s.shape >= 0 && s.shapeN > 0) {
+      shapeLine.textContent = 'Beat shape (research preview): ' + s.shape + '% typical of ' + s.shapeN + ' beats';
+      shapeLine.style.display = 'block';
+    } else {
+      shapeLine.style.display = 'none';
+    }
+    if (Date.now() > toggleBusyUntil) sensorsToggle.checked = !!s.sensorsOn;
+
+    if (s.status === 'danger') {
+      banner.textContent = '⚠ DANGER — ' + s.bpm + ' BPM · vibration alert active';
+      banner.classList.add('show');
+      document.body.classList.add('banner-on');
+    } else {
+      banner.classList.remove('show');
+      document.body.classList.remove('banner-on');
+    }
+
+    if (typeof s.checkSeq === 'number') {
+      if (lastCheckSeq === null || s.checkSeq < lastCheckSeq) {
+        lastCheckSeq = s.checkSeq;                      // first packet / suit rebooted: no alert
+      } else if (s.checkSeq > lastCheckSeq) {
+        lastCheckSeq = s.checkSeq;
+        if (s.status === 'normal' || s.status === 'danger') alertCheck(s);
+      }
+    }
+  }
+
+  /* ---------- alerts after a BPM check ---------- */
+  function beep(freq, ms, when){
+    if (!audioCtx) return;
+    var o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.frequency.value = freq; o.type = 'sine';
+    g.gain.setValueAtTime(0.0001, audioCtx.currentTime + when);
+    g.gain.exponentialRampToValueAtTime(0.3, audioCtx.currentTime + when + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + when + ms / 1000);
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(audioCtx.currentTime + when); o.stop(audioCtx.currentTime + when + ms / 1000 + 0.05);
+  }
+
+  function systemNotify(title, body){
+    if (!window.isSecureContext || !('Notification' in window) || Notification.permission !== 'granted') return;
+    var opts = {body: body, tag: 'serenisuit'};
+    var plain = function(){ try { new Notification(title, opts); } catch (e) {} };
+    if (navigator.serviceWorker && navigator.serviceWorker.getRegistration) {
+      navigator.serviceWorker.getRegistration().then(function(reg){
+        if (reg) reg.showNotification(title, opts); else plain();
+      }).catch(plain);
+    } else {
+      plain();
+    }
+  }
+
+  function alertCheck(s){
+    var danger = s.status === 'danger';
+    var title = danger ? '⚠ DANGER — ' + s.bpm + ' BPM' : 'BPM check: ' + s.bpm + ' BPM — normal';
+    var body  = danger ? 'Outside 60–100 BPM. Vibration alert is running on the suit.' : 'Within the 60–100 BPM range.';
+    toast(title, danger ? 'danger' : 'ok');
+    if (!alertsOn) return;
+    if (navigator.vibrate) navigator.vibrate(danger ? [250, 120, 250, 120, 250] : [90]);
+    if (danger) { beep(880, 180, 0); beep(880, 180, 0.3); beep(880, 180, 0.6); }
+    else        { beep(660, 120, 0); }
+    systemNotify(danger ? 'SereniSuit — DANGER' : 'SereniSuit — BPM check', title + '. ' + body);
+  }
+
+  alertBtn.addEventListener('click', function(){
+    try {
+      var AC = window.AudioContext || window.webkitAudioContext;
+      if (AC && !audioCtx) audioCtx = new AC();
+      if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+    } catch (e) {}
+    alertsOn = true;
+    alertBtn.textContent = 'On';
+    alertBtn.className = 'btn-on';
+    beep(660, 100, 0);
+    if (navigator.vibrate) navigator.vibrate(60);
+    if (window.isSecureContext && 'Notification' in window && Notification.permission === 'default') {
+      Notification.requestPermission();
+    }
+    alertHint.textContent = 'Banner, sound, vibration and system notifications after every BPM check.';
+  });
+
+  /* ---------- controls ---------- */
+  sensorsToggle.addEventListener('change', function(){
+    toggleBusyUntil = Date.now() + 1500;
+    command({type: 'sensors', on: sensorsToggle.checked});
+  });
+  function sendDemo(v){
+    if (isNaN(v) || v < 1 || v > 300) { toast('Enter a BPM between 1 and 300'); return; }
+    command({type: 'demo', bpm: v});
+  }
+  Array.prototype.forEach.call(document.querySelectorAll('.quick button'), function(b){
+    b.addEventListener('click', function(){ sendDemo(parseInt(b.getAttribute('data-bpm'), 10)); });
+  });
+  $('sendDemoBtn').addEventListener('click', function(){ sendDemo(parseInt(demoInput.value, 10)); });
+  demoInput.addEventListener('keydown', function(e){ if (e.key === 'Enter') sendDemo(parseInt(demoInput.value, 10)); });
+  $('clearDemoBtn').addEventListener('click', function(){ command({type: 'demo', clear: true}); });
+
+  function showUnsupported(why){
+    unsupported = why;
+    var n = $('unsupported');
+    n.textContent = why; n.style.display = 'block';
+    connectBtn.style.display = 'none';
+  }
+
+  setInterval(sendHello, 5000);                     // heartbeat keeps this device listed
+  document.addEventListener('visibilitychange', function(){
+    if (document.visibilityState === 'visible') sendHello();
+  });
+
+  if (window.isSecureContext && 'serviceWorker' in navigator) {
+    navigator.serviceWorker.register('sw.js').catch(function(){});   // offline copy + notifications
+  }
+
+  var why = unsupportedReason();
+  if (why) showUnsupported(why);
+  render();
+})();
+</script>
+</body>
+</html>
