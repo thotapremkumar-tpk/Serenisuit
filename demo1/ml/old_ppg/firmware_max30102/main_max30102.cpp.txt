@@ -1,0 +1,1264 @@
+/* ============================================================================
+ * SereniSuit — Demo 1 firmware  (ESP32-S3-DevKitC-1 N8R8)
+ *
+ * WHAT RUNS LIVE  (this is the demo)
+ *   Fingertip pulse (MAX30102) -> BPM on the website and mobile app
+ *   (the board's RGB LED stays off; ENABLE_STATUS_LED 1 turns status colours on)
+ *   Outside 60-100 BPM -> "DANGER" + vibration through the DRV8833
+ *   This is a threshold on heart RATE. Deterministic arithmetic, not ML.
+ *
+ * STANDALONE DEMO  (power bank only, no laptop cable)
+ *   The suit makes its own Wi-Fi network (SereniSuit-Demo). Join it from the
+ *   laptop AND the phone, open http://192.168.4.1 on both - they pair and run
+ *   side by side. Everything that used to need the serial monitor (IP address,
+ *   ML self-test result) is now on the dashboard.
+ *
+ * NO OLED IN DEMO 1  (ENABLE_OLED 0)
+ *   The OLED was dropped to keep the wiring simple. Its code is still here:
+ *   set ENABLE_OLED to 1 to bring it back (SDA 8, SCL 9, address 0x3C).
+ *
+ * WI-FI DASHBOARD  (website on the laptop + mobile app on the phone, same page)
+ *     - "Paired" status: every open website/app says hello over a WebSocket
+ *       and heart-beats every 5 s; the device lists who is paired
+ *     - the SAME status label drives the website, the app and the RGB LED
+ *     - remote ON/OFF for the pulse sensor
+ *     - an alert on every device after every BPM check
+ *     - demo mode: type a BPM into the website or app and it drives the LED
+ *       and motor exactly as a live reading would (normal = shown only,
+ *       abnormal = DANGER + vibration)
+ *
+ * BLUETOOTH  (optional second link, runs at the same time as Wi-Fi)
+ *   The ESP32-S3 also has Bluetooth LE built in. The suit advertises as
+ *   "SereniSuit"; the Bluetooth dashboard (demo1/bluetooth-app/index.html,
+ *   Chrome or Edge on a laptop or Android phone) connects without joining any
+ *   Wi-Fi. Same reading, same pairing list, same commands - a laptop on Wi-Fi
+ *   and a phone on Bluetooth show up side by side as paired devices.
+ *
+ * WHAT THE ML DOES HERE  (proof of capability, not control)
+ *   A PPG arousal classifier trained on the Cognitive Strain dataset
+ *   (22 participants, 1,672 windows of 30 s) is compiled into this firmware
+ *   as plain C - 1.3 KB, 16 features, no ML library. At boot it scores 8 real
+ *   30-second PPG windows stored in flash. The result is shown on the
+ *   dashboard (and printed over serial when a laptop is on).
+ *
+ *   It does NOT drive the motor or the LED. Scoring a LIVE finger needs
+ *   on-device feature extraction plus a per-wearer calm baseline recorded
+ *   first - that is Demo 2 / Phase 2, deliberately not wired in here.
+ *
+ * Offline accuracy, leave-one-subject-out (22 folds):
+ *   raw features, unseen stranger ........ 0.600   (AUC 0.623)
+ *   wearer-calibrated, unseen subject .... 0.6770  (AUC 0.7561)  <- deployed
+ *   random 5-fold ........................ ~0.80   INFLATED - do not quote
+ *
+ * Serial commands (115200, only when a laptop is connected):
+ *     m  - re-run the ML self-test
+ *     t  - toggle forced DANGER
+ *     i  - print Wi-Fi status / dashboard URL
+ *     h  - help
+ * ==========================================================================*/
+
+#include <Arduino.h>
+#include <Wire.h>
+/* ------------------------------------------------------------ options */
+#define ENABLE_OLED       0     // 1 = SSD1306 OLED fitted on SDA 8 / SCL 9
+#define ENABLE_STATUS_LED 0     // 1 = on-board RGB LED shows the status colours
+#define STATUS_LED_PIN    38    // on-board RGB LED ("RGB@IO38"; v1.0 boards: 48)
+#define STATUS_LED_BRIGHT 24    // 0-255, kept low so it isn't blinding
+
+#if ENABLE_OLED
+  #include <Adafruit_GFX.h>
+  #include <Adafruit_SSD1306.h>
+#endif
+#include "MAX30105.h"
+#include "heartRate.h"
+
+#include <WiFi.h>
+#include <ESPmDNS.h>
+#include <ESPAsyncWebServer.h>
+#include <ArduinoJson.h>
+#include <freertos/semphr.h>
+
+#include "ppg_model.h"
+#include "ppg_test_windows.h"
+#include "web_dashboard.h"
+
+/* ----------------------------------------------------------------- pins */
+#define I2C_SDA     8
+#define I2C_SCL     9
+#define MOTOR_PIN   4          // -> DRV8833 IN1  (12-pin board: IN1 IN2 VCC GND IN3 IN4)
+#define OLED_ADDR   0x3C
+#define MAX30102_ADDR 0x57
+
+/* ------------------------------------------------------------- Wi-Fi ---
+ * USE_ROUTER_WIFI 0  ->  the suit creates its own network (DEFAULT, best for
+ *                        the review: no router, no laptop cable, fixed
+ *                        address http://192.168.4.1).
+ * USE_ROUTER_WIFI 1  ->  join WIFI_SSID first (e.g. your phone's hotspot, so
+ *                        the laptop keeps internet); if that fails within
+ *                        WIFI_CONNECT_TIMEOUT_MS it falls back to its own
+ *                        network. The address it got is shown on the OLED.
+ * ---------------------------------------------------------------------- */
+#define USE_ROUTER_WIFI         0
+#define WIFI_SSID               "YOUR_WIFI_SSID"
+#define WIFI_PASSWORD           "YOUR_WIFI_PASSWORD"
+#define WIFI_CONNECT_TIMEOUT_MS 8000
+
+#define AP_SSID         "SereniSuit-Demo"
+#define AP_PASSWORD     "seresuit123"   // >= 8 chars, required for WPA2
+#define AP_CHANNEL      1
+#define AP_MAX_STATIONS 4               // laptop + phone + 2 spare
+#define MDNS_NAME       "serenisuit"    // also reachable as http://serenisuit.local
+
+/* 11 dBm is plenty for one room and trims the Wi-Fi transmit current spikes,
+ * which matters on a power bank that is also feeding the motor. */
+#define WIFI_TX_POWER   WIFI_POWER_11dBm
+
+/* -------------------------------------------------------- Bluetooth ---
+ * Bluetooth LE only - the ESP32-S3 has no "classic" Bluetooth. Web Bluetooth
+ * works in Chrome / Edge on laptops and Android; iPhone Safari does not
+ * support it (use the Wi-Fi dashboard there). Set to 0 to switch it off.
+ * ---------------------------------------------------------------------- */
+#define ENABLE_BLUETOOTH  1
+#define BLE_NAME          "SereniSuit"
+#define BLE_SERVICE_UUID  "5e7e5000-24e2-498b-a477-c675190a743e"
+#define BLE_STATE_UUID    "5e7e5001-24e2-498b-a477-c675190a743e"  // read+notify: live status
+#define BLE_DEVICES_UUID  "5e7e5002-24e2-498b-a477-c675190a743e"  // read+notify: paired devices
+#define BLE_CMD_UUID      "5e7e5003-24e2-498b-a477-c675190a743e"  // write: hello/sensors/demo
+#define BLE_INFO_UUID     "5e7e5004-24e2-498b-a477-c675190a743e"  // read: network, ML self-test
+#define BLE_ID_BASE       0x10000UL     // pairing ids for Bluetooth links (WebSocket ids stay below)
+
+#if ENABLE_BLUETOOTH
+  #include <NimBLEDevice.h>
+#endif
+
+#define STATE_BROADCAST_MS 500          // how often every screen is refreshed
+#define MAX_PAIRED         6            // devices listed as paired at once
+#define PAIR_TIMEOUT_MS    15000        // silent this long -> no longer paired
+
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+
+/* --------------------------------------------------------- LEDC compat --
+ * Arduino-ESP32 core 3.x replaced ledcSetup/ledcAttachPin with ledcAttach.
+ * This builds on both, so it does not matter which core PlatformIO resolves.
+ * ---------------------------------------------------------------------- */
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  #define MOTOR_INIT()  ledcAttach(MOTOR_PIN, MOTOR_FREQ, MOTOR_RES)
+  #define MOTOR_SET(d)  ledcWrite(MOTOR_PIN, (d))
+#else
+  #define MOTOR_INIT()  do { ledcSetup(MOTOR_CH, MOTOR_FREQ, MOTOR_RES); \
+                             ledcAttachPin(MOTOR_PIN, MOTOR_CH); } while (0)
+  #define MOTOR_SET(d)  ledcWrite(MOTOR_CH, (d))
+#endif
+
+/* ------------------------------------------------------------ thresholds */
+#define BPM_NORMAL_LOW    60
+#define BPM_NORMAL_HIGH  100
+#define FINGER_IR_MIN  50000
+#define DEMO_BPM_MIN       1
+#define DEMO_BPM_MAX     300
+
+/* --------------------------------------------------------- motor / PWM */
+#define MOTOR_CH        0
+#define MOTOR_FREQ   5000
+#define MOTOR_RES       8
+#define MOTOR_DUTY    153      // 60% of 255 -> ~3.0 V from the 5 V rail
+#define MOTOR_PULSE_MS 400
+
+#define SCREEN_W 128
+#define SCREEN_H  64
+#if ENABLE_OLED
+Adafruit_SSD1306 display(SCREEN_W, SCREEN_H, &Wire, -1);
+#endif
+MAX30105 sensor;
+
+static const byte RATE_SIZE = 6;
+static const byte MIN_BEATS = 4;    // beats needed before a BPM is shown
+static byte  rates[RATE_SIZE];
+static byte  rateSpot   = 0;
+static byte  rateCount  = 0;        // valid entries in rates[]
+static unsigned long lastBeat = 0;  // 0 = no previous beat yet
+static int   beatAvg    = 0;
+
+/* Start a fresh reading. Averaging only over real beats (not the empty
+ * slots) stops a just-placed finger from reading "12 BPM -> DANGER". */
+static void resetBeatAverage() {
+  beatAvg   = 0;
+  rateSpot  = 0;
+  rateCount = 0;
+  lastBeat  = 0;
+  memset(rates, 0, sizeof(rates));
+}
+
+static bool          motorOn      = false;
+static unsigned long motorToggle  = 0;
+static bool          forceDanger  = false;   // serial 't'
+static bool          sensorOk     = false;   // MAX30102 found (at boot or later)
+#if ENABLE_OLED
+static bool          oledOk       = false;   // OLED answered on I2C
+#endif
+
+/* ------------------------------------------------------------ status ---
+ * ONE status value drives the website, the app and the LED (and the OLED
+ * when fitted), so they
+ * always say the same thing. */
+enum SuitStatus { ST_BOOTING, ST_SENSORS_OFF, ST_SENSOR_ERROR, ST_NO_FINGER,
+              ST_READING, ST_NORMAL, ST_DANGER };
+static const char *STATUS_NAME[] = { "booting", "sensors_off", "sensor_error",
+                                     "no_finger", "reading", "normal", "danger" };
+
+/* ------------------------------------ requests from the website / app ---
+ * Written by the web server or Bluetooth task, read by loop(). Plain flags/values only -
+ * loop() does the actual work, so the two tasks never fight over the
+ * beat-averaging buffer. */
+static volatile bool     sensorsEnabled     = true;
+static volatile bool     demoActive         = false;
+static volatile int      demoBpm            = 0;
+static volatile uint32_t demoSeq            = 0;     // bumps on every fake input
+static volatile bool     resetAvgRequested  = false;
+static volatile bool     pairingChanged     = false;
+
+/* ------------------------------------------------------ shared state ---
+ * Touched by both tasks -> guarded by stateLock. */
+struct PairedDevice {
+  bool          used;
+  uint32_t      id;          // WebSocket client id, or BLE_ID_BASE + BLE connection
+  char          via;         // 'w' = Wi-Fi, 'b' = Bluetooth
+  char          label[32];   // "Website (Mac)", "Mobile app (Android)" ...
+  char          token[12];   // random tag the page picks, so it can spot itself
+  unsigned long lastSeen;
+};
+static PairedDevice      paired[MAX_PAIRED];
+static String            lastStateJson =
+    "{\"status\":\"booting\",\"bpm\":0,\"danger\":false,\"sensorsOn\":true,"
+    "\"demoActive\":false,\"checkSeq\":0,\"paired\":0,\"devices\":[]}";
+static SemaphoreHandle_t stateLock = nullptr;
+
+static inline void lockState()   { xSemaphoreTake(stateLock, portMAX_DELAY); }
+static inline void unlockState() { xSemaphoreGive(stateLock); }
+
+/* ------------------------------------------ boot-time facts (read-only) */
+static char netName[33]   = "";
+static char ipStr[20]     = "0.0.0.0";
+static bool ownNetwork    = true;       // true = suit's own AP
+static int  mlCorrect     = 0;
+static unsigned long mlMeanUs = 0;
+
+/* ================================================== pairing table ===
+ * All helpers expect the caller to hold stateLock. */
+static bool pairUpsert(uint32_t id, const char *label, char via, const char *token) {
+  for (int i = 0; i < MAX_PAIRED; i++) {
+    if (paired[i].used && paired[i].id == id) {
+      strlcpy(paired[i].label, label, sizeof(paired[i].label));
+      strlcpy(paired[i].token, token, sizeof(paired[i].token));
+      paired[i].lastSeen = millis();
+      return false;                                   // already paired
+    }
+  }
+  for (int i = 0; i < MAX_PAIRED; i++) {
+    if (!paired[i].used) {
+      paired[i].used = true;
+      paired[i].id   = id;
+      paired[i].via  = via;
+      strlcpy(paired[i].label, label, sizeof(paired[i].label));
+      strlcpy(paired[i].token, token, sizeof(paired[i].token));
+      paired[i].lastSeen = millis();
+      return true;                                    // newly paired
+    }
+  }
+  return false;                                       // table full
+}
+
+static bool pairRemove(uint32_t id) {
+  for (int i = 0; i < MAX_PAIRED; i++) {
+    if (paired[i].used && paired[i].id == id) { paired[i].used = false; return true; }
+  }
+  return false;
+}
+
+static bool pairExpire() {
+  bool changed = false;
+  unsigned long now = millis();
+  for (int i = 0; i < MAX_PAIRED; i++) {
+    if (paired[i].used && now - paired[i].lastSeen > PAIR_TIMEOUT_MS) {
+      paired[i].used = false;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+static int pairCount() {
+  int n = 0;
+  for (int i = 0; i < MAX_PAIRED; i++) if (paired[i].used) n++;
+  return n;
+}
+
+/* ================================================ shared commands ===
+ * The website (HTTP / WebSocket) and the Bluetooth page both end up here,
+ * so a command does exactly the same thing whichever link it came over. */
+static bool cmdHello(uint32_t clientId, const char *label, char via, const char *token) {
+  lockState();
+  bool isNew = pairUpsert(clientId, label, via, token);
+  unlockState();
+  if (isNew) pairingChanged = true;
+  return isNew;
+}
+
+static void cmdSensors(bool on) {
+  if (on && !sensorsEnabled) resetAvgRequested = true;   // no stale average
+  sensorsEnabled = on;
+}
+
+static bool cmdDemo(int v) {
+  if (v < DEMO_BPM_MIN || v > DEMO_BPM_MAX) return false;
+  demoBpm    = v;
+  demoActive = true;
+  demoSeq    = demoSeq + 1;                              // every fake input counts as a new check
+  return true;
+}
+
+static void cmdDemoClear() {
+  demoActive = false;
+  resetAvgRequested = true;
+}
+
+/* ======================================================= ML self-test ===*/
+static void runSelfTest() {
+  int correct = 0;
+  unsigned long total_us = 0;
+
+  Serial.println();
+  Serial.println(F("=== PPG arousal model - on-device self-test ==="));
+  Serial.println(F("win   true      predicted   P(high)     us"));
+
+  for (int w = 0; w < N_TEST_WIN; w++) {
+    unsigned long t0 = micros();
+    float p = ppg_arousal_score(test_feats[w]);
+    unsigned long dt = micros() - t0;
+    total_us += dt;
+
+    int pred = (p > 0.5f) ? 1 : 0;
+    if (pred == test_labels[w]) correct++;
+
+    Serial.printf("  %d   %-8s  %-10s  %6.3f  %5lu%s\n",
+                  w,
+                  test_labels[w] ? "high" : "low",
+                  pred            ? "high" : "low",
+                  p, dt,
+                  pred == test_labels[w] ? "" : "   <-- MISS");
+  }
+
+  mlCorrect = correct;
+  mlMeanUs  = total_us / N_TEST_WIN;
+
+  Serial.printf("correct: %d/%d   mean inference %lu us\n",
+                correct, N_TEST_WIN, mlMeanUs);
+  Serial.printf("model: 16-feature logistic regression, 1.3 KB, no ML library\n");
+  Serial.printf("offline LOSO accuracy: 0.6770 (AUC 0.7561), wearer-calibrated\n");
+  Serial.printf("scored from saved windows - the live demo uses the BPM threshold\n");
+  Serial.printf("free heap: %u bytes\n", (unsigned)ESP.getFreeHeap());
+  Serial.println(F("==============================================="));
+  Serial.println();
+}
+
+/* ======================================================== Wi-Fi info ===*/
+static void printWifiInfo() {
+  Serial.printf("Wi-Fi: %s \"%s\"   Dashboard: http://%s/  (or http://%s.local/)\n",
+                ownNetwork ? "own network" : "joined", netName, ipStr, MDNS_NAME);
+  if (ownNetwork) Serial.printf("Wi-Fi password: %s\n", AP_PASSWORD);
+#if ENABLE_BLUETOOTH
+  Serial.printf("Bluetooth: \"%s\"  (open demo1/bluetooth-app in Chrome/Edge)\n", BLE_NAME);
+#endif
+}
+
+static void startOwnNetwork() {
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASSWORD, AP_CHANNEL, 0, AP_MAX_STATIONS);
+  WiFi.setTxPower(WIFI_TX_POWER);
+  ownNetwork = true;
+  strlcpy(netName, AP_SSID, sizeof(netName));
+  strlcpy(ipStr, WiFi.softAPIP().toString().c_str(), sizeof(ipStr));
+}
+
+static void startWiFi() {
+#if USE_ROUTER_WIFI
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);                 // snappier WebSocket updates
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_CONNECT_TIMEOUT_MS) {
+    delay(250);
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFi.setTxPower(WIFI_TX_POWER);
+    ownNetwork = false;
+    strlcpy(netName, WIFI_SSID, sizeof(netName));
+    strlcpy(ipStr, WiFi.localIP().toString().c_str(), sizeof(ipStr));
+  } else {
+    Serial.println(F("Could not join WIFI_SSID - starting the suit's own network"));
+    WiFi.disconnect(true);
+    startOwnNetwork();
+  }
+#else
+  startOwnNetwork();
+#endif
+
+  if (MDNS.begin(MDNS_NAME)) MDNS.addService("http", "tcp", 80);
+  printWifiInfo();
+}
+
+/* ================================================= broadcast state ===*/
+/* Builds the one JSON snapshot every website/app renders, caches it for
+ * newly connected clients, and pushes it to all of them. */
+#if ENABLE_BLUETOOTH
+static void bleNotify(const String &state, const String &devices);   // defined below
+#endif
+
+static void broadcastState(SuitStatus st, int bpm, uint32_t checkSeq) {
+  String out, bleState, bleDevices;
+
+  lockState();
+  JsonDocument doc;
+  doc["status"]     = STATUS_NAME[st];
+  doc["bpm"]        = bpm;
+  doc["danger"]     = (st == ST_DANGER);
+  doc["sensorsOn"]  = (bool)sensorsEnabled;
+  doc["demoActive"] = (bool)demoActive;
+  doc["checkSeq"]   = checkSeq;
+  doc["paired"]     = pairCount();
+  JsonArray devices = doc["devices"].to<JsonArray>();
+  for (int i = 0; i < MAX_PAIRED; i++) {
+    if (!paired[i].used) continue;
+    JsonObject d = devices.add<JsonObject>();
+    d["id"]    = paired[i].id;
+    d["label"] = String(paired[i].label) + (paired[i].via == 'b' ? " · Bluetooth" : " · Wi-Fi");
+    d["via"]   = paired[i].via == 'b' ? "bt" : "wifi";
+  }
+  serializeJson(doc, out);
+  lastStateJson = out;
+
+#if ENABLE_BLUETOOTH
+  /* Bluetooth packets are small, so the live status uses short keys
+   * (s=status b=bpm so=sensors on da=demo active q=check number n=paired). */
+  JsonDocument bs;
+  bs["s"]  = STATUS_NAME[st];
+  bs["b"]  = bpm;
+  bs["so"] = sensorsEnabled ? 1 : 0;
+  bs["da"] = demoActive ? 1 : 0;
+  bs["q"]  = checkSeq;
+  bs["n"]  = pairCount();
+  serializeJson(bs, bleState);
+
+  JsonDocument bd;                      // [[id, label, "wifi"|"bt", token], ...]
+  JsonArray list = bd.to<JsonArray>();
+  for (int i = 0; i < MAX_PAIRED; i++) {
+    if (!paired[i].used) continue;
+    JsonArray e = list.add<JsonArray>();
+    e.add(paired[i].id);
+    e.add(String(paired[i].label));
+    e.add(paired[i].via == 'b' ? "bt" : "wifi");
+    e.add(String(paired[i].token));
+  }
+  serializeJson(bd, bleDevices);
+#endif
+  unlockState();
+
+  ws.textAll(out);
+#if ENABLE_BLUETOOTH
+  bleNotify(bleState, bleDevices);
+#endif
+}
+
+/* ======================================================= WebSocket ===*/
+static void onWsEvent(AsyncWebSocket *srv, AsyncWebSocketClient *client,
+                      AwsEventType type, void *arg, uint8_t *data, size_t len) {
+  switch (type) {
+    case WS_EVT_CONNECT: {
+      String snapshot;
+      lockState();
+      snapshot = lastStateJson;
+      unlockState();
+      client->text(snapshot);          // show the reading at once; paired after "hello"
+      break;
+    }
+
+    case WS_EVT_DISCONNECT: {
+      lockState();
+      bool removed = pairRemove(client->id());
+      unlockState();
+      if (removed) pairingChanged = true;
+      break;
+    }
+
+    case WS_EVT_DATA: {
+      AwsFrameInfo *info = (AwsFrameInfo *)arg;
+      if (!(info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT)) break;
+
+      JsonDocument msg;
+      if (deserializeJson(msg, data, len) != DeserializationError::Ok) break;
+
+      const char *kind = msg["type"] | "";
+      if (strcmp(kind, "hello") == 0) {          // sent on open and every 5 s
+        const char *label = msg["device"] | "Device";
+        const char *token = msg["token"] | "";
+        if (cmdHello(client->id(), label, 'w', token)) {
+          client->text(String("{\"type\":\"paired\",\"id\":") + client->id() + "}");
+        }
+      }
+      break;
+    }
+
+    default:
+      break;
+  }
+}
+
+/* ======================================================= HTTP routes ===*/
+static void setupWebServer() {
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *req) {
+    AsyncWebServerResponse *res = req->beginResponse_P(200, "text/html", DASHBOARD_HTML);  // streamed from flash
+    res->addHeader("Cache-Control", "no-cache");
+    req->send(res);
+  });
+
+  server.on("/manifest.json", HTTP_GET, [](AsyncWebServerRequest *req) {
+    req->send_P(200, "application/manifest+json", DASHBOARD_MANIFEST);
+  });
+
+  server.on("/icon.svg", HTTP_GET, [](AsyncWebServerRequest *req) {
+    req->send_P(200, "image/svg+xml", DASHBOARD_ICON_SVG);
+  });
+
+  server.on("/sw.js", HTTP_GET, [](AsyncWebServerRequest *req) {
+    req->send_P(200, "application/javascript", DASHBOARD_SW);
+  });
+
+  server.on("/api/state", HTTP_GET, [](AsyncWebServerRequest *req) {
+    String snapshot;
+    lockState();
+    snapshot = lastStateJson;
+    unlockState();
+    req->send(200, "application/json", snapshot);
+  });
+
+  /* boot-time facts - set once in setup(), read-only afterwards */
+  server.on("/api/info", HTTP_GET, [](AsyncWebServerRequest *req) {
+    JsonDocument doc;
+    doc["network"]   = netName;
+    doc["ownNet"]    = ownNetwork;
+    doc["ip"]        = ipStr;
+    doc["mdns"]      = MDNS_NAME ".local";
+    doc["sensorOk"]  = sensorOk;
+    doc["mlCorrect"] = mlCorrect;
+    doc["mlTotal"]   = N_TEST_WIN;
+    doc["mlUs"]      = mlMeanUs;
+#if ENABLE_BLUETOOTH
+    doc["bluetooth"] = BLE_NAME;
+#endif
+    String out;
+    serializeJson(doc, out);
+    req->send(200, "application/json", out);
+  });
+
+  server.on("/api/sensors", HTTP_POST,
+    [](AsyncWebServerRequest *req) {},
+    nullptr,
+    [](AsyncWebServerRequest *req, uint8_t *data, size_t len, size_t, size_t) {
+      JsonDocument doc;
+      if (deserializeJson(doc, data, len) == DeserializationError::Ok && !doc["on"].isNull()) {
+        cmdSensors(doc["on"].as<bool>());
+      }
+      req->send(200, "application/json", "{\"ok\":true}");
+    });
+
+  server.on("/api/demo", HTTP_POST,
+    [](AsyncWebServerRequest *req) {},
+    nullptr,
+    [](AsyncWebServerRequest *req, uint8_t *data, size_t len, size_t, size_t) {
+      JsonDocument doc;
+      bool ok = false;
+      if (deserializeJson(doc, data, len) == DeserializationError::Ok) {
+        bool clearFlag = doc["clear"] | false;
+        if (clearFlag) {
+          cmdDemoClear();
+          ok = true;
+        } else if (!doc["bpm"].isNull()) {
+          ok = cmdDemo(doc["bpm"].as<int>());
+        }
+      }
+      req->send(ok ? 200 : 400, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
+    });
+
+  ws.onEvent(onWsEvent);
+  server.addHandler(&ws);
+  server.begin();
+}
+
+/* ======================================================== Bluetooth ===
+ * GATT service "SereniSuit":
+ *   STATE   read + notify   {"s":"normal","b":72,"so":1,"da":0,"q":5,"n":2}
+ *   DEVICES read + notify   [[id,"Website (Mac)","wifi","k3f9"], ...]
+ *   CMD     write           {"type":"hello","device":"...","token":"..."}
+ *                           {"type":"sensors","on":false}
+ *                           {"type":"demo","bpm":140} / {"type":"demo","clear":true}
+ *   INFO    read            network, address, pulse sensor, ML self-test
+ * A Bluetooth link counts as paired once its page says hello (same rule as
+ * Wi-Fi) and drops off the list when the link closes. */
+#if ENABLE_BLUETOOTH
+static NimBLECharacteristic *bleStateChr   = nullptr;
+static NimBLECharacteristic *bleDevicesChr = nullptr;
+static NimBLECharacteristic *bleInfoChr    = nullptr;
+static String                bleLastDevices;
+
+class SuitServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer *srv, ble_gap_conn_desc *desc) override {
+    NimBLEDevice::startAdvertising();          // stay visible so a second device can join
+  }
+  void onDisconnect(NimBLEServer *srv, ble_gap_conn_desc *desc) override {
+    lockState();
+    bool removed = pairRemove((uint32_t)(BLE_ID_BASE + desc->conn_handle));
+    unlockState();
+    if (removed) pairingChanged = true;         // NimBLE restarts advertising by itself
+  }
+};
+
+class SuitCommandCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic *chr, ble_gap_conn_desc *desc) override {
+    NimBLEAttValue value = chr->getValue();
+    JsonDocument msg;
+    if (deserializeJson(msg, (const char *)value.data(), value.length()) != DeserializationError::Ok) return;
+
+    const char *kind = msg["type"] | "";
+    if (strcmp(kind, "hello") == 0) {
+      cmdHello((uint32_t)(BLE_ID_BASE + desc->conn_handle),
+               msg["device"] | "Device", 'b', msg["token"] | "");
+    } else if (strcmp(kind, "sensors") == 0 && !msg["on"].isNull()) {
+      cmdSensors(msg["on"].as<bool>());
+    } else if (strcmp(kind, "demo") == 0) {
+      bool clearFlag = msg["clear"] | false;
+      if (clearFlag)                   cmdDemoClear();
+      else if (!msg["bpm"].isNull())   cmdDemo(msg["bpm"].as<int>());
+    }
+  }
+};
+
+static void bleSetText(NimBLECharacteristic *chr, const String &text) {
+  chr->setValue((const uint8_t *)text.c_str(), text.length());
+}
+
+static void startBluetooth() {
+  NimBLEDevice::init(BLE_NAME);
+  NimBLEDevice::setMTU(247);                   // room for a whole status packet
+
+  NimBLEServer *srv = NimBLEDevice::createServer();
+  srv->setCallbacks(new SuitServerCallbacks());
+
+  NimBLEService *svc = srv->createService(BLE_SERVICE_UUID);
+  bleStateChr   = svc->createCharacteristic(BLE_STATE_UUID,   NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+  bleDevicesChr = svc->createCharacteristic(BLE_DEVICES_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+  bleInfoChr    = svc->createCharacteristic(BLE_INFO_UUID,    NIMBLE_PROPERTY::READ);
+  NimBLECharacteristic *cmd =
+                  svc->createCharacteristic(BLE_CMD_UUID,     NIMBLE_PROPERTY::WRITE);
+  cmd->setCallbacks(new SuitCommandCallbacks());
+
+  bleSetText(bleStateChr,   "{\"s\":\"booting\",\"b\":0,\"so\":1,\"da\":0,\"q\":0,\"n\":0}");
+  bleSetText(bleDevicesChr, "[]");
+  bleSetText(bleInfoChr,    "{}");
+  svc->start();
+
+  NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
+  adv->addServiceUUID(BLE_SERVICE_UUID);
+  adv->setScanResponse(true);                  // name goes in the scan response
+  adv->start();
+}
+
+/* boot-time facts for the Bluetooth page's "Suit" card */
+static void bleSetInfo() {
+  JsonDocument doc;
+  doc["network"]   = netName;
+  doc["ownNet"]    = ownNetwork;
+  doc["ip"]        = ipStr;
+  doc["bluetooth"] = BLE_NAME;
+  doc["sensorOk"]  = sensorOk;
+  doc["mlCorrect"] = mlCorrect;
+  doc["mlTotal"]   = N_TEST_WIN;
+  doc["mlUs"]      = mlMeanUs;
+  String out;
+  serializeJson(doc, out);
+  bleSetText(bleInfoChr, out);
+}
+
+static void bleNotify(const String &state, const String &devices) {
+  if (!bleStateChr) return;
+  bleSetText(bleStateChr, state);
+  if (bleStateChr->getSubscribedCount() > 0) bleStateChr->notify();
+  if (devices != bleLastDevices) {             // the list only goes out when it changes
+    bleLastDevices = devices;
+    bleSetText(bleDevicesChr, devices);
+    if (bleDevicesChr->getSubscribedCount() > 0) bleDevicesChr->notify();
+  }
+}
+#endif
+
+#if ENABLE_OLED
+/* =========================================================== OLED ===*/
+static void oledBottomBar(int nPaired) {
+  display.drawFastHLine(0, 53, SCREEN_W, SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 56);
+  if (nPaired > 0) {
+    display.printf("Paired: %d device%s", nPaired, nPaired == 1 ? "" : "s");
+  } else {
+    display.printf("Open %s", ipStr);
+  }
+}
+
+static void oledRender(SuitStatus st, int bpm, int nPaired) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+
+  switch (st) {
+    case ST_SENSORS_OFF:
+      display.setCursor(0, 8);   display.println(F("Sensors OFF"));
+      display.setCursor(0, 22);  display.println(F("Turned off from the"));
+      display.setCursor(0, 32);  display.println(F("website / app"));
+      break;
+
+    case ST_SENSOR_ERROR:
+      display.setCursor(0, 4);   display.println(F("Pulse sensor not"));
+      display.setCursor(0, 14);  display.println(F("found - check wiring"));
+      display.setCursor(0, 30);  display.println(F("Demo input still"));
+      display.setCursor(0, 40);  display.println(F("works from the app"));
+      break;
+
+    case ST_NO_FINGER:
+      display.setCursor(0, 16);  display.println(F("Place finger on"));
+      display.setCursor(0, 28);  display.println(F("the pulse sensor"));
+      break;
+
+    case ST_READING:
+    case ST_BOOTING:
+      display.setCursor(0, 22);  display.println(F("Reading..."));
+      break;
+
+    case ST_NORMAL:
+    case ST_DANGER:
+      display.setTextSize(2);
+      display.setCursor(0, 2);
+      if (bpm > 0) display.printf("%d BPM", bpm);
+      else         display.print(F("-- BPM"));
+      if (demoActive) {
+        display.setTextSize(1);
+        display.setCursor(104, 0);
+        display.print(F("DEMO"));
+      }
+      if (st == ST_DANGER) {
+        display.setTextSize(2);
+        display.setCursor(0, 26);
+        display.println(F("DANGER!"));
+      } else {
+        display.setTextSize(1);
+        display.setCursor(0, 28);  display.println(F("Status: NORMAL"));
+        display.setCursor(0, 40);  display.println(F("range 60-100 BPM"));
+      }
+      break;
+  }
+
+  oledBottomBar(nPaired);
+  display.display();
+}
+
+/* Shown at boot so the demo needs no laptop: how to connect, and the ML proof. */
+static void oledBootScreens() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);   display.println(F("SereniSuit"));
+  display.setCursor(0, 16);  display.printf("ML self-test: %d/%d\n", mlCorrect, N_TEST_WIN);
+  display.setCursor(0, 26);  display.printf("%lu us per window\n", mlMeanUs);
+  display.setCursor(0, 36);  display.println(F("on-chip, 1.3 KB model"));
+  display.setCursor(0, 52);  display.println(sensorOk ? F("Pulse sensor: OK") : F("Pulse sensor: MISSING"));
+  display.display();
+  delay(2500);
+
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println(ownNetwork ? F("Join Wi-Fi:") : F("Wi-Fi joined:"));
+  display.setCursor(0, 10);  display.println(netName);
+  if (ownNetwork) {
+    display.setCursor(0, 20);  display.printf("Pass: %s\n", AP_PASSWORD);
+  }
+  display.setCursor(0, 34);  display.println(F("Open on laptop+phone:"));
+  display.setCursor(0, 46);  display.printf("http://%s\n", ipStr);
+#if ENABLE_BLUETOOTH
+  display.setCursor(0, 56);  display.printf("BLE: %s\n", BLE_NAME);
+#endif
+  display.display();
+  delay(5000);
+}
+#else
+/* ================================================ status without an OLED ===
+ * The board's own RGB LED shows the state, and every change is printed on
+ * the Serial Monitor. Same names as the website and app. */
+static void statusLed(uint8_t r, uint8_t g, uint8_t b) {
+  static int32_t last = -1;
+  int32_t c = ((int32_t)r << 16) | ((int32_t)g << 8) | b;
+  if (c == last) return;                  // only talk to the LED on a change
+  last = c;
+#if ENABLE_STATUS_LED
+  neopixelWrite(STATUS_LED_PIN, r, g, b);
+#endif
+}
+
+static void oledRender(SuitStatus st, int bpm, int nPaired) {
+  const uint8_t B = STATUS_LED_BRIGHT;
+  switch (st) {
+    case ST_NORMAL:       statusLed(0, B, 0);            break;   // green
+    case ST_DANGER:       if ((millis() / 400) % 2) statusLed(B, 0, 0);   // red,
+                          else                      statusLed(0, 0, 0);   // flashing
+                          break;
+    case ST_READING:      statusLed(B, B / 2, 0);        break;   // amber
+    case ST_NO_FINGER:    statusLed(0, 0, B);            break;   // blue
+    case ST_SENSOR_ERROR: statusLed(B, 0, B);            break;   // purple
+    case ST_SENSORS_OFF:  statusLed(0, 0, 0);            break;   // off
+    default:              statusLed(0, 0, B / 2);        break;
+  }
+  static SuitStatus lastSt = ST_BOOTING;
+  static int lastBpm = -1, lastPaired = -1;
+  if (st != lastSt || bpm != lastBpm || nPaired != lastPaired) {
+    Serial.printf("status: %-12s bpm: %3d   paired devices: %d\n", STATUS_NAME[st], bpm, nPaired);
+    lastSt = st; lastBpm = bpm; lastPaired = nPaired;
+  }
+}
+
+static void oledBootScreens() {
+  Serial.printf("ML self-test %d/%d, pulse sensor %s.\n",
+                mlCorrect, N_TEST_WIN, sensorOk ? "OK" : "MISSING");
+}
+#endif
+
+/* ------------------------------------------------ I2C check at boot ---*/
+static bool i2cPresent(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  return Wire.endTransmission() == 0;
+}
+
+/* Wiring self-check (inputs only - nothing is driven). Returns one line,
+ * e.g. "SDA(8) OK 3114 mV | SCL(9) not connected 3106 mV -> <what to fix>".
+ * Run at start-up and every 3 s while the sensor is missing, so a moved
+ * wire shows up in the Serial Monitor straight away. */
+static String i2cDiagnose() {
+  Wire.end();
+  /* with the internal pull-DOWN on, a pin only reads HIGH if it really
+     reaches the 3.3 V pull-ups on its line */
+  pinMode(I2C_SDA, INPUT_PULLDOWN);
+  pinMode(I2C_SCL, INPUT_PULLDOWN);
+  delay(5);
+  const int   pins[2]  = { I2C_SDA, I2C_SCL };
+  const char *names[2] = { "SDA", "SCL" };
+  bool up[2] = { (bool)digitalRead(I2C_SDA), (bool)digitalRead(I2C_SCL) };
+
+  char out[280] = "";
+  char hint[170] = "";
+  for (int k = 0; k < 2; k++) {
+    /* voltage with the weak internal pull-up: ~3.3 V but not reaching the
+       pull-ups = floating; ~0 V = tied to GND; in between = pulled down */
+    pinMode(pins[k], INPUT_PULLUP);
+    delay(5);
+    uint32_t mv = analogReadMilliVolts(pins[k]);
+    pinMode(pins[k], INPUT);
+    const char *st = up[k] ? "OK" : mv >= 2400 ? "not connected" : mv < 300 ? "tied to GND" : "pulled down";
+    char part[64];
+    snprintf(part, sizeof(part), "%s(%d) %s %lu mV | ", names[k], pins[k], st, (unsigned long)mv);
+    strncat(out, part, sizeof(out) - strlen(out) - 1);
+    if (!up[k] && !hint[0]) {
+      if (mv >= 2400)    snprintf(hint, sizeof(hint), "the %s wire is not in pin %d's column, or it is loose", names[k], pins[k]);
+      else if (mv < 300) snprintf(hint, sizeof(hint), "the %s line touches GND - check its wire and resistor legs", names[k]);
+      else               snprintf(hint, sizeof(hint), "a %s resistor leg is in the - rail instead of the + rail", names[k]);
+    }
+  }
+
+  /* one hole off? ESP32 header order on this side: ... 18, 8, 3, 46, 9, 10 ... */
+  const int nb[2][2] = { { 18, 3 }, { 46, 10 } };
+  for (int k = 0; k < 2; k++) {
+    if (up[k]) continue;
+    for (int n : nb[k]) {
+      pinMode(n, INPUT_PULLDOWN);
+      delay(5);
+      if (digitalRead(n))
+        snprintf(hint, sizeof(hint), "the %s wire is in pin %d's column: move it to pin %d", names[k], n, pins[k]);
+      pinMode(n, INPUT);
+    }
+  }
+
+  /* SDA and SCL swapped? try the bus the other way round */
+  Wire.begin(I2C_SCL, I2C_SDA);
+  Wire.setClock(100000);
+  bool swapped = i2cPresent(MAX30102_ADDR) || (ENABLE_OLED && i2cPresent(OLED_ADDR));
+  Wire.end();
+  if (swapped)
+    snprintf(hint, sizeof(hint), "SDA and SCL are SWAPPED: swap the two wires at ESP32 pins 8 and 9");
+  else if (!hint[0])
+    snprintf(hint, sizeof(hint), "pins 8/9 are wired; check MAX30102 VIN -> 3V3 and GND -> G, and that you used the pins printed VIN/GND/SCL/SDA");
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(100000);
+
+  /* does ANY chip answer, at any address? (a different sensor, or a board
+     strapped to another address, would show up here) */
+  char others[48] = "";
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    if (addr == MAX30102_ADDR || !i2cPresent(addr)) continue;
+    char a[8];
+    snprintf(a, sizeof(a), " 0x%02X", addr);
+    strncat(others, a, sizeof(others) - strlen(others) - 1);
+  }
+  if (others[0]) {
+    snprintf(hint, sizeof(hint), "a chip answers at%s but not at 0x57 - is this really a MAX30102/MAX30105?", others);
+  } else if (!swapped && up[0] && up[1]) {
+    snprintf(hint, sizeof(hint), "no chip answers at any address: the sensor has no power or its pins are not soldered - check VIN -> 3V3, GND -> G, and the solder joints");
+  }
+  strncat(out, "-> ", sizeof(out) - strlen(out) - 1);
+  strncat(out, hint, sizeof(out) - strlen(out) - 1);
+  return String(out);
+}
+
+/* Lists which chips answer on SDA/SCL, so a wiring fault is obvious in the
+ * Serial Monitor: expect 0x57 (MAX30102), plus 0x3C when the OLED is fitted. */
+static void i2cReport() {
+  Serial.print(F("I2C scan (100 kHz):"));
+  int found = 0;
+  for (uint8_t a = 1; a < 127; a++) {
+    Wire.beginTransmission(a);
+    uint8_t r = Wire.endTransmission();
+    if (r == 0) {
+      found++;
+      Serial.printf(" 0x%02X%s", a,
+                    a == OLED_ADDR ? " (OLED)" : a == MAX30102_ADDR ? " (MAX30102)" : "");
+    } else if (r == 5) {                      // timeout: a line is being held low
+      Serial.printf(" [bus timeout at 0x%02X - SDA or SCL held low?]", a);
+      break;
+    }
+  }
+  if (found) { Serial.println(); return; }
+  Serial.println(F(" nothing answered"));
+  Serial.printf("  wiring check: %s\n", i2cDiagnose().c_str());
+}
+
+/* ------------------------------------------ sensor contact watchdog ---
+ * The MAX30102 can answer once and then drop out when a header pin is not
+ * soldered or a jumper is loose. A read from a missing chip retries for
+ * 250 ms and floods the Serial Monitor with "i2cWriteReadNonStop returned
+ * Error -1", so check it is still there before every read. Three misses in
+ * a row = lost: back to "sensor not found" and the 3 s re-check. */
+static unsigned long sensorDrops = 0;
+
+/* A real read, not just an address ping: some bad contacts (e.g. a loose
+ * VIN/GND pin that sags when the sensor's LEDs switch on) still ACK the
+ * address but fail every register read. PART_ID (0xFF) must read 0x15. */
+static bool sensorResponds() {
+  Wire.beginTransmission(MAX30102_ADDR);
+  Wire.write(0xFF);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((uint8_t)MAX30102_ADDR, (uint8_t)1) != 1) return false;
+  return Wire.read() == 0x15;
+}
+
+/* Idle "high" level of SDA and SCL with nothing driving them (only the
+ * pull-up resistors). The ESP32 needs >= ~2.5 V to read a 1. Many black
+ * MAX30102 boards pull these lines to their own 1.8 V, which drags the level
+ * down to ~2-2.6 V: some transfers work, others fail. */
+static void printBusLevels() {
+  Wire.end();
+  pinMode(I2C_SDA, INPUT);
+  pinMode(I2C_SCL, INPUT);
+  delay(3);
+  uint32_t sda = analogReadMilliVolts(I2C_SDA), scl = analogReadMilliVolts(I2C_SCL);
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(100000);
+  uint32_t low = sda < scl ? sda : scl;
+  Serial.printf("  bus idle level: SDA %lu mV, SCL %lu mV -> %s\n", (unsigned long)sda, (unsigned long)scl,
+                low >= 2800 ? "good (so the fault is the sensor's VIN/GND power or a contact)"
+              : low >= 2000 ? "TOO LOW: the sensor board pulls SDA/SCL to 1.8 V - see the guide"
+              :               "far too low: a line is shorted or the pull-ups are missing");
+}
+
+static bool sensorStillThere() {
+  static uint8_t misses = 0;
+  if (sensorResponds()) { misses = 0; return true; }
+  if (++misses < 3) return false;
+  misses = 0;
+  sensorOk = false;
+  sensorDrops++;
+  resetBeatAverage();
+  Serial.printf("MAX30102 LOST (drop-out #%lu) - the connection keeps breaking: "
+                "solder its header pins and press its 4 wires in. Re-checking every 3 s.\n",
+                sensorDrops);
+  printBusLevels();
+#if ENABLE_BLUETOOTH
+  bleSetInfo();
+#endif
+  return false;
+}
+
+/* ============================================================== setup ===*/
+void setup() {
+  Serial.begin(115200);
+  delay(1200);                 // gives the Serial Monitor time to attach after an upload
+
+  MOTOR_INIT();
+  MOTOR_SET(0);
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(100000);
+
+  Serial.println(F("\nSereniSuit Demo 1 booting..."));
+  i2cReport();
+
+#if ENABLE_OLED
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println(F("OLED not found at 0x3C - try 0x3D, check SDA/SCL"));
+    while (true) delay(10);
+  }
+  oledOk = i2cPresent(OLED_ADDR);
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 24);
+  display.println(F("Starting Wi-Fi..."));
+  display.display();
+#endif
+#if ENABLE_STATUS_LED
+  neopixelWrite(STATUS_LED_PIN, 0, 0, STATUS_LED_BRIGHT / 2);   // dim blue while starting
+#else
+  neopixelWrite(STATUS_LED_PIN, 0, 0, 0);                       // RGB LED kept off
+#endif
+
+  stateLock = xSemaphoreCreateMutex();
+  memset(paired, 0, sizeof(paired));
+
+  startWiFi();
+  setupWebServer();
+#if ENABLE_BLUETOOTH
+  startBluetooth();
+#endif
+  Serial.printf("Wi-Fi + Bluetooth up at %lu ms\n", millis());
+
+  /* prove the model works on-device before any sensor is involved */
+  runSelfTest();
+
+  /* a missing sensor no longer stops the demo - fake-BPM input still works */
+  /* 100 kHz: slower than the 400 kHz default but far more tolerant of
+     breadboard jumpers and weak pull-ups; plenty for the sensor's data rate */
+  unsigned long tSensor = millis();
+  sensorOk = sensor.begin(Wire, I2C_SPEED_STANDARD);
+  Serial.printf("MAX30102: %s (%lu ms, boot at %lu ms)\n", sensorOk ? "found" : "NOT found",
+                millis() - tSensor, millis());
+  if (sensorOk) {
+    sensor.setup();
+    sensor.setPulseAmplitudeRed(0x0A);
+    sensor.setPulseAmplitudeGreen(0);
+  } else {
+    Serial.println(F("MAX30102 not found - demo input from the website/app still works."));
+    Serial.println(F("If an I2C scan cannot see 0x57, fit ~5k pull-ups (two 10k side by side)"));
+    Serial.println(F("from SDA and SCL to 3V3 - many black modules pull to 1.8 V."));
+  }
+
+#if ENABLE_BLUETOOTH
+  bleSetInfo();
+#endif
+  oledBootScreens();
+
+  Serial.println(F("ready. commands: m = self-test, t = force danger, i = wifi info, h = help"));
+}
+
+/* =============================================================== loop ===*/
+void loop() {
+  static SuitStatus    prevStatus    = ST_BOOTING;
+  static uint32_t      checkSeq      = 0;
+  static uint32_t      lastDemoSeq   = 0;
+  static unsigned long lastHousekeep = 0;
+  static unsigned long lastBroadcast = 0;
+  static bool          lastLiveFinger = false, lastLiveHave = false;
+  static int           lastLiveBpm    = 0;
+
+  /* ---- serial (only when a laptop happens to be connected) ---- */
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c == 'm') runSelfTest();
+    else if (c == 't') {
+      forceDanger = !forceDanger;
+      Serial.printf("forced danger: %s\n", forceDanger ? "ON" : "off");
+    } else if (c == 'i') {
+      printWifiInfo();
+    } else if (c == 'h') {
+      Serial.println(F("m = ML self-test | t = toggle forced danger | i = wifi info | h = help"));
+    }
+  }
+
+  /* ---- housekeeping: drop dead sockets and silent devices ---- */
+  if (millis() - lastHousekeep > 1000) {
+    ws.cleanupClients();
+    lockState();
+    bool expired = pairExpire();
+    unlockState();
+    if (expired) pairingChanged = true;
+    lastHousekeep = millis();
+  }
+
+  /* ---- a chip missing at start-up is picked up as soon as its wires are
+          right - no reset needed. Progress is printed every 3 s. ---- */
+  static unsigned long lastProbe = 0;
+#if ENABLE_OLED
+  bool needProbe = !oledOk || !sensorOk;
+#else
+  bool needProbe = !sensorOk;
+#endif
+  if (needProbe && millis() - lastProbe > 3000) {
+    lastProbe = millis();
+    bool m   = sensorResponds();                       // a real register read
+    bool ack = m || i2cPresent(MAX30102_ADDR);          // ...or only the address?
+#if ENABLE_OLED
+    bool o = i2cPresent(OLED_ADDR);
+    Serial.printf("I2C check: OLED %s, MAX30102 %s\n", o ? "OK" : "missing", m ? "OK" : "missing");
+    if (!o && !m) Serial.printf("  wiring check: %s\n", i2cDiagnose().c_str());
+    if (o && !oledOk) {
+      oledOk = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
+      display.clearDisplay();
+      display.setTextColor(SSD1306_WHITE);
+      display.setTextSize(1);
+      Serial.println(F("OLED found - display on."));
+    }
+#else
+    if (m)        Serial.println(F("I2C check: MAX30102 OK"));
+    else if (ack) Serial.println(F("I2C check: MAX30102 answers its address but its data reads fail - "
+                                   "a loose VIN, GND or SDA contact on the sensor (it can brown out when "
+                                   "its LEDs switch on), or SDA/SCL sitting at a too-low voltage."));
+    if (!m && ack) printBusLevels();
+    else          Serial.printf("I2C check: MAX30102 missing | %s\n", i2cDiagnose().c_str());
+#endif
+    if (m && !sensorOk) {
+      sensorOk = sensor.begin(Wire, I2C_SPEED_STANDARD);
+      if (sensorOk) {
+        sensor.setup();
+        sensor.setPulseAmplitudeRed(0x0A);
+        sensor.setPulseAmplitudeGreen(0);
+        if (sensorDrops) Serial.printf("MAX30102 back (it has dropped out %lu time%s - its contact is loose).\n",
+                                       sensorDrops, sensorDrops == 1 ? "" : "s");
+        else             Serial.println(F("MAX30102 found - live readings on."));
+#if ENABLE_BLUETOOTH
+        bleSetInfo();
+#endif
+      }
+    }
+  }
+
+  if (resetAvgRequested) {
+    resetAvgRequested = false;
+    resetBeatAverage();
+  }
+
+  /* ---- where the BPM comes from: fake input, live sensor, or nothing ---- */
+  bool demo        = demoActive;
+  bool finger      = false;
+  bool haveReading = false;
+  int  bpm         = 0;
+
+  if (demo) {
+    finger = haveReading = true;
+    bpm    = demoBpm;
+  } else if (sensorsEnabled && sensorOk && !sensorStillThere()) {
+    finger      = lastLiveFinger;              // brief contact glitch: hold the
+    haveReading = lastLiveHave;                // last reading instead of flickering
+    bpm         = lastLiveBpm;
+  } else if (sensorsEnabled && sensorOk) {
+    long ir = sensor.getIR();
+    finger = ir > FINGER_IR_MIN;
+    if (!finger && (rateCount || lastBeat)) resetBeatAverage();   // finger lifted
+
+    if (finger && checkForBeat(ir)) {
+      unsigned long now = millis();
+      if (lastBeat != 0) {                       // need two beats for an interval
+        float b = 60000.0f / (float)(now - lastBeat);
+        if (b > 20 && b < 255) {
+          rates[rateSpot++] = (byte)b;
+          rateSpot %= RATE_SIZE;
+          if (rateCount < RATE_SIZE) rateCount++;
+          int sum = 0;
+          for (byte i = 0; i < rateCount; i++) sum += rates[i];
+          beatAvg = sum / rateCount;
+        }
+      }
+      lastBeat = now;
+    }
+    haveReading = finger && rateCount >= MIN_BEATS;
+    bpm         = haveReading ? beatAvg : 0;
+    lastLiveFinger = finger;
+    lastLiveHave   = haveReading;
+    lastLiveBpm    = bpm;
+  }
+
+  bool outOfRange = bpm > 0 && (bpm < BPM_NORMAL_LOW || bpm > BPM_NORMAL_HIGH);
+
+  /* ---- one status for every screen ---- */
+  SuitStatus st;
+  if (forceDanger)                 st = ST_DANGER;
+  else if (demo)                   st = outOfRange ? ST_DANGER : ST_NORMAL;
+  else if (!sensorsEnabled)        st = ST_SENSORS_OFF;
+  else if (!sensorOk)              st = ST_SENSOR_ERROR;
+  else if (!finger)                st = ST_NO_FINGER;
+  else if (!haveReading)           st = ST_READING;
+  else                             st = outOfRange ? ST_DANGER : ST_NORMAL;
+
+  /* ---- a "BPM check" completes when a verdict appears or changes, or a
+          new fake value arrives -> every paired device alerts once ---- */
+  bool verdict = (st == ST_NORMAL || st == ST_DANGER);
+  uint32_t ds  = demoSeq;
+  if ((verdict && st != prevStatus) || (demo && ds != lastDemoSeq)) {
+    checkSeq++;
+  }
+  lastDemoSeq = ds;
+  prevStatus  = st;
+
+  /* ---- actuator: non-blocking buzz so display and beat detection never stall ---- */
+  if (st == ST_DANGER) {
+    if (millis() - motorToggle > MOTOR_PULSE_MS) {
+      motorOn = !motorOn;
+      MOTOR_SET(motorOn ? MOTOR_DUTY : 0);
+      motorToggle = millis();
+    }
+  } else {
+    MOTOR_SET(0);
+    motorOn = false;
+  }
+
+  /* ---- OLED (or RGB LED + Serial when there is no OLED) ---- */
+  lockState();
+  int nPaired = pairCount();
+  unlockState();
+  oledRender(st, bpm, nPaired);
+
+  /* ---- website + app: the moment anything on the OLED changes, and every
+          500 ms regardless, so every screen stays in lockstep ---- */
+  static uint32_t   lastSentSeq    = 0;
+  static SuitStatus lastSentStatus = ST_BOOTING;
+  static int        lastSentBpm    = -1;
+  static bool       lastSentSensors = true, lastSentDemo = false;
+  bool sensorsNow = sensorsEnabled;
+  if (pairingChanged || checkSeq != lastSentSeq || st != lastSentStatus || bpm != lastSentBpm ||
+      sensorsNow != lastSentSensors || demo != lastSentDemo ||
+      millis() - lastBroadcast > STATE_BROADCAST_MS) {
+    pairingChanged = false;
+    broadcastState(st, bpm, checkSeq);
+    lastSentSeq     = checkSeq;
+    lastSentStatus  = st;
+    lastSentBpm     = bpm;
+    lastSentSensors = sensorsNow;
+    lastSentDemo    = demo;
+    lastBroadcast   = millis();
+  }
+
+  delay(20);
+}
