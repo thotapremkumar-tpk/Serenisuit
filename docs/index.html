@@ -12,10 +12,16 @@
 <link rel="icon" href="icon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="icon-192.png">
 <!--
-  SereniSuit — Bluetooth dashboard.
+  SereniSuit — Bluetooth dashboard (Phase 2).
   Same screen as the Wi-Fi dashboard the suit serves itself, but it talks to
   the suit over Bluetooth LE (Web Bluetooth), so this device does not have to
   join the suit's Wi-Fi.
+
+  Phase 2 firmware (phase2/firmware): heart rate + on-chip stress model
+  (random forest trained on WESAD), skin conductance (Grove GSR), movement
+  (MPU-6050), personal calibration, calming vibration, WESAD replay demo.
+  With the older Demo 1 firmware the Phase 2 cards stay hidden and the page
+  works exactly as before.
 
   Works in: Chrome or Edge on Mac / Windows / Linux / Android.
   Not in:   iPhone / iPad browsers (Apple has no Web Bluetooth) -> use the
@@ -117,13 +123,43 @@
   .toast.show{opacity:1;transform:none;}
   .toast.danger{background:var(--danger);color:#fff;}
   .toast.ok{background:var(--ok);color:#06111f;}
+
+  /* Phase 2 */
+  .p2{display:none;}
+  body.phase2 .p2{display:block;}
+  .stress-big{display:flex;align-items:baseline;gap:10px;justify-content:center;margin-top:4px;}
+  .stress-word{font-size:34px;font-weight:700;letter-spacing:.02em;}
+  .stress-pct{color:var(--muted);font-size:16px;font-variant-numeric:tabular-nums;}
+  .stress-word.calm{color:var(--ok);} .stress-word.stress{color:var(--danger);}
+  .stress-word.wait{color:var(--accent);font-size:22px;} .stress-word.off{color:var(--muted);font-size:22px;}
+  .meter{height:10px;border-radius:999px;background:#0d1626;border:1px solid var(--line);margin:12px 0 4px;overflow:hidden;position:relative;}
+  .meter i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--ok),var(--warn),var(--danger));transition:width .4s;}
+  .meter b{position:absolute;top:-3px;bottom:-3px;left:50%;width:2px;background:var(--text);opacity:.5;}
+  .scale{display:flex;justify-content:space-between;color:var(--muted);font-size:11px;}
+  .calmbox{margin-top:12px;border-radius:12px;padding:10px 12px;background:rgba(79,168,255,.12);color:var(--accent);
+    font-size:13px;font-weight:600;text-align:center;display:none;}
+  .breath{display:inline-block;width:12px;height:12px;border-radius:50%;background:var(--accent);margin-right:8px;
+    vertical-align:-1px;animation:breathe 10s infinite ease-in-out;}
+  @keyframes breathe{0%{transform:scale(.6);}40%{transform:scale(1.5);}100%{transform:scale(.6);}}
+  .feats{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:14px;text-align:center;}
+  .feats div{background:#0d1626;border:1px solid var(--line);border-radius:10px;padding:8px 2px;}
+  .feats b{display:block;font-size:16px;font-variant-numeric:tabular-nums;}
+  .feats span{color:var(--muted);font-size:10px;}
+  .bar2{height:8px;border-radius:999px;background:#0d1626;border:1px solid var(--line);margin-top:10px;overflow:hidden;}
+  .bar2 i{display:block;height:100%;width:0;background:var(--accent);transition:width .4s;}
+  .btns{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;}
+  .btns button{flex:1 1 auto;}
+  .replay{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:10px;}
+  .replay button{padding:9px 4px;line-height:1.25;font-size:13px;}
+  .replay small{display:block;font-weight:500;font-size:11px;opacity:.8;}
+  .tag{font-size:11px;padding:3px 9px;border-radius:999px;background:rgba(79,168,255,.15);color:var(--accent);font-weight:600;}
 </style>
 </head>
 <body>
   <div class="banner" id="banner"></div>
 
   <h1>SereniSuit</h1>
-  <div class="sub">Live heart rate over Bluetooth · from the suit's ECG (AD8232)</div>
+  <div class="sub" id="subLine">Live heart rate over Bluetooth · from the suit's ECG (AD8232)</div>
 
   <div class="card pair" id="pairCard">
     <div class="pair-head"><span class="pair-dot"></span><span id="pairTitle">Not connected</span></div>
@@ -133,11 +169,27 @@
     <ul class="devices" id="deviceList"></ul>
   </div>
 
+  <div class="card p2">
+    <div class="top"><span class="label">Stress</span><span class="tag" id="replayTag" style="display:none;">WESAD REPLAY</span></div>
+    <div class="stress-big"><span class="stress-word wait" id="stressWord">—</span><span class="stress-pct" id="stressPct"></span></div>
+    <div class="meter"><i id="meterFill"></i><b></b></div>
+    <div class="scale"><span>calm</span><span>threshold 50 %</span><span>stressed</span></div>
+    <div class="hint" id="stressNote" style="text-align:center;margin-top:8px;"></div>
+    <div class="calmbox" id="calmBox"><span class="breath"></span>Calming vibration on — breathe with it: in 4 s · out 6 s</div>
+    <div class="feats">
+      <div><b id="fHr">--</b><span>HR (60 s)</span></div>
+      <div><b id="fRm">--</b><span>RMSSD ms</span></div>
+      <div><b id="fGsr">--</b><span>GSR µS</span></div>
+      <div><b id="fMov">--</b><span>motion</span></div>
+    </div>
+  </div>
+
   <div class="card">
     <div class="top">
       <span class="pill" id="demoPill" style="display:none;">DEMO INPUT</span>
       <span class="pill bt">BLUETOOTH</span>
     </div>
+    <div class="label p2" style="text-align:center;margin-top:4px;">Heart rate</div>
     <div class="bpm-row">
       <span class="bpm" id="bpmValue">--</span>
       <span class="bpm-unit">BPM</span>
@@ -146,14 +198,35 @@
     <div class="hint" id="shapeLine" style="display:none;text-align:center;margin-top:8px;"></div>
   </div>
 
+  <div class="card p2">
+    <div class="label">Personal calibration</div>
+    <div class="hint" id="calHint">Sit still for 3 minutes with the electrodes and the GSR on. The model compares
+      everything to this rest baseline. It is saved on the suit.</div>
+    <div class="bar2" id="calBar" style="display:none;"><i id="calFill"></i></div>
+    <div class="btns">
+      <button class="btn-primary p2btn" id="calBtn">Calibrate (3 min)</button>
+      <button class="btn-ghost p2btn" id="calClear">Clear</button>
+    </div>
+  </div>
+
   <div class="card">
     <div class="row">
       <div>
         <div class="label">Sensors</div>
-        <div class="hint">Switch the suit's ECG sensor (AD8232) on or off.</div>
+        <div class="hint" id="sensorsHint">Switch the suit's ECG sensor (AD8232) on or off.</div>
       </div>
       <label class="switch">
         <input type="checkbox" id="sensorsToggle" checked disabled>
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="row p2row" style="display:none;">
+      <div>
+        <div class="label">Calming vibration</div>
+        <div class="hint">Breathing pacer on the motors when stress is detected.</div>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="calmToggle" checked disabled>
         <span class="slider"></span>
       </label>
     </div>
@@ -166,8 +239,27 @@
     </div>
   </div>
 
+  <div class="card p2">
+    <div class="label">Motors</div>
+    <div class="hint">Test each motor, or feel the calming pattern for 20 s.</div>
+    <div class="btns">
+      <button class="btn-ghost p2btn" data-test="a">Motor A</button>
+      <button class="btn-ghost p2btn" data-test="b">Motor B</button>
+      <button class="btn-ghost p2btn" data-test="calm">Calming</button>
+      <button class="btn-ghost p2btn" data-test="stop">Stop</button>
+    </div>
+  </div>
+
+  <div class="card p2">
+    <div class="label">Demo — real WESAD data through the suit's model</div>
+    <div class="hint">Each button feeds one real 60 s recording (heart + skin) of a person the model never saw
+      through the full chain on the chip. A stress window starts the calming vibration.</div>
+    <div class="replay" id="replayBtns"></div>
+    <button class="btn-ghost full p2btn" id="replayStop">Back to live sensors</button>
+  </div>
+
   <div class="card">
-    <div class="label">Demo — fake BPM input</div>
+    <div class="label" id="demoBpmTitle">Demo — fake BPM input</div>
     <div class="hint">Drives the suit exactly like a real reading. 60–100 is normal and is just shown.
       Outside that range the suit shows DANGER and vibrates.</div>
     <div class="quick">
@@ -190,7 +282,20 @@
       <dt>ECG sensor</dt><dd id="iSensor">—</dd>
       <dt>Screen</dt><dd id="iOled">—</dd>
       <dt>On-chip ML</dt><dd id="iMl">—</dd>
+      <dt class="p2">Self-test</dt><dd class="p2" id="iSt">—</dd>
     </dl>
+    <details class="p2">
+      <summary>What the stress number means</summary>
+      <ol>
+        <li>Every 10 s the suit takes the last 60 s: heart rate and its variability (RMSSD, SDNN, pNN50),
+          skin conductance level, trend and responses.</li>
+        <li>Each is compared with your own 3-minute rest calibration.</li>
+        <li>A small random forest (100 trees) trained on WESAD (15 people, a lab stress test) gives P(stress);
+          the suit shows the average of the last 30 s and says “stressed” at 50 % or more.</li>
+        <li>While you move it pauses — walking changes heart rate and sweating too.</li>
+        <li>A research prototype: it is not a medical device and does not diagnose stress or anxiety.</li>
+      </ol>
+    </details>
     <details>
       <summary>Install as an app on your phone</summary>
       <ol>
@@ -206,7 +311,7 @@
 
 <script>
 (function(){
-  /* must match the firmware (src/main.cpp) */
+  /* must match the firmware (phase2/firmware/src/net.cpp; Demo 1: demo1/firmware/src/main.cpp) */
   var SVC      = '5e7e5000-24e2-498b-a477-c675190a743e';
   var CH_STATE = '5e7e5001-24e2-498b-a477-c675190a743e';
   var CH_DEV   = '5e7e5002-24e2-498b-a477-c675190a743e';
@@ -216,7 +321,7 @@
   var $ = function(id){ return document.getElementById(id); };
   var bpmEl = $('bpmValue'), statusEl = $('statusBadge'), demoPill = $('demoPill');
   var pairCard = $('pairCard'), pairTitle = $('pairTitle'), pairSub = $('pairSub'), deviceList = $('deviceList');
-  var connectBtn = $('connectBtn'), sensorsToggle = $('sensorsToggle');
+  var connectBtn = $('connectBtn'), sensorsToggle = $('sensorsToggle'), calmToggle = $('calmToggle');
   var alertBtn = $('alertBtn'), alertHint = $('alertHint'), demoInput = $('demoBpmInput'), banner = $('banner');
 
   var dec = new TextDecoder(), enc = new TextEncoder();
@@ -226,8 +331,10 @@
   var token = Math.random().toString(36).slice(2, 8);   // lets this page find itself in the paired list
   var myLabel = deviceLabel();
   var devices = [], known = null;
-  var lastState = null, lastCheckSeq = null;
-  var alertsOn = false, audioCtx = null, toggleBusyUntil = 0;
+  var lastState = null, lastCheckSeq = null, lastStressSeq = null;
+  var alertsOn = false, audioCtx = null, toggleBusyUntil = 0, calmBusyUntil = 0;
+  var phase2 = false;                 // the suit runs the Phase 2 firmware (stress model)
+  var windows = ['stress', 'stress', 'stress', 'baseline', 'amusement', 'meditation'];
   var unsupported = '';              // set when this browser can't do Web Bluetooth
 
   /* ---------- who am I ---------- */
@@ -262,6 +369,19 @@
     reading:      {text:'READING…',       cls:'wait'},
     booting:      {text:'STARTING…',      cls:'wait'}
   };
+  var STRESS = {
+    calm:{text:'CALM',cls:'calm'}, stress:{text:'STRESSED',cls:'stress'},
+    off:{text:'Sensors off',cls:'off'}, need_cal:{text:'Calibrate first',cls:'wait'},
+    calibrating:{text:'Calibrating…',cls:'wait'}, waiting:{text:'Reading…',cls:'wait'},
+    no_signal:{text:'No signal',cls:'off'}, moving:{text:'Moving — paused',cls:'wait'}
+  };
+  var NOTE = {
+    off:'Sensors are switched off.', need_cal:'Press Calibrate and sit still for 3 minutes.',
+    calibrating:'Sit still and breathe normally.', waiting:'Collecting the first 60 s of signal.',
+    no_signal:'No clean heart or skin signal — check the electrodes and the GSR.',
+    moving:'You are moving — the stress model pauses until you are still.'
+  };
+  var MODEL = ['model: heart + skin', 'model: heart only (GSR off)', 'model: skin only (ECG off)'];
 
   /* ---------- Bluetooth plumbing ----------
    * Chrome allows one GATT operation at a time, so every read/write/subscribe
@@ -295,9 +415,9 @@
     if (!navigator.bluetooth) {
       var ios = /iPhone|iPad|iPod/i.test(navigator.userAgent || '');
       return ios ? 'iPhone and iPad browsers cannot use Bluetooth from a web page. Use the Wi-Fi dashboard ' +
-                   '(join SereniSuit-Demo, open http://192.168.4.1) — or the Bluefy app.'
+                   '(join the suit\'s own Wi-Fi, open http://192.168.4.1) — or the Bluefy app.'
                  : 'This browser cannot use Bluetooth from a web page. Use Chrome or Edge, or the Wi-Fi dashboard ' +
-                   '(join SereniSuit-Demo, open http://192.168.4.1).';
+                   '(join the suit\'s own Wi-Fi, open http://192.168.4.1).';
     }
     return '';
   }
@@ -312,7 +432,7 @@
       return;
     }
     navigator.bluetooth.requestDevice({
-      filters: [{services: [SVC]}, {namePrefix: 'SereniSuit'}],
+      filters: [{services: [SVC]}, {namePrefix: 'SereniSuit'}, {namePrefix: 'ArogyaAegis'}],
       optionalServices: [SVC]
     }).then(function(d){
       if (device && device !== d) device.removeEventListener('gattserverdisconnected', onLinkLost);
@@ -336,7 +456,10 @@
       .then(function(c){
         chState = c[0]; chDev = c[1]; chCmd = c[2]; chInfo = c[3];
         chState.oncharacteristicvaluechanged = function(e){
-          try { onState(JSON.parse(dec.decode(e.target.value))); } catch (err) {}
+          var parsed = null;
+          try { parsed = JSON.parse(dec.decode(e.target.value)); } catch (err) {}
+          if (parsed) onState(parsed);
+          else readJSON(chState).then(onState).catch(function(){});   // packet cut by a small MTU: read it whole
         };
         chDev.oncharacteristicvaluechanged = function(){
           readJSON(chDev).then(onDevices).catch(function(){});   // full list, even if long
@@ -376,19 +499,63 @@
   /* ---------- incoming data ---------- */
   function onState(b){
     // short keys from the suit: s status, b bpm, so sensors on, da demo active, q check number, n paired
+    // Phase 2 adds: ss stress state, sp P(stress) %, sq stress check number, g GSR uS, mv moving,
+    //   cp calibration %, hb baseline saved (bit 1 heart, bit 2 skin), cm calming now, co calming on,
+    //   rp replayed window, hr HR of the 60 s window, rm RMSSD, eo/go heart/skin window ok, im IMU found,
+    //   mi model (0 heart+skin, 1 heart, 2 skin, -1 none)
+    if (b.ss !== undefined && !phase2) setPhase2(true);
     applyState({status: b.s, bpm: b.b, sensorsOn: !!b.so, demoActive: !!b.da, checkSeq: b.q, paired: b.n,
-                shape: (b.sh === undefined ? -1 : b.sh), shapeN: b.sn || 0});
+                shape: (b.sh === undefined ? -1 : b.sh), shapeN: b.sn || 0,
+                stress: b.ss, stressP: (b.sp === undefined ? -1 : b.sp), stressSeq: b.sq, gsr: b.g, moving: !!b.mv,
+                calPct: b.cp || 0, base: b.hb || 0, calming: !!b.cm, calmOn: b.co !== 0, replay: (b.rp === undefined ? -1 : b.rp),
+                hr: b.hr || 0, rmssd: b.rm || 0, ecgOk: !!b.eo, edaOk: !!b.go, imuOk: !!b.im,
+                model: (b.mi === undefined ? -1 : b.mi)});
+  }
+  function setPhase2(on){
+    phase2 = on;
+    document.body.classList.toggle('phase2', on);
+    Array.prototype.forEach.call(document.querySelectorAll('.p2row'), function(r){ r.style.display = on ? 'flex' : 'none'; });
+    $('subLine').textContent = on ? 'Phase 2 over Bluetooth · heart (AD8232 ECG) · skin (Grove GSR) · movement (MPU-6050) · on-chip stress model'
+                                  : 'Live heart rate over Bluetooth · from the suit\'s ECG (AD8232)';
+    $('sensorsHint').textContent = on ? 'ECG, GSR and motion sensor on or off.' : 'Switch the suit\'s ECG sensor (AD8232) on or off.';
+    $('demoBpmTitle').textContent = on ? 'Demo — fake BPM input (Phase 1)' : 'Demo — fake BPM input';
+    renderReplayButtons();
+    render();
   }
   function onDevices(list){
     devices = (list || []).map(function(e){ return {id: e[0], label: e[1], via: e[2], token: e[3]}; });
     render();
   }
+  function pct(x){ return (100 * x).toFixed(1) + ' %'; }
   function showInfo(i){
     $('iBt').textContent = (i.bluetooth || 'SereniSuit') + ' (connected)';
-    $('iNet').textContent = i.network + (i.ownNet ? ' · http://' + i.ip : ' · http://' + i.ip);
-    $('iSensor').textContent = (i.sensor || 'AD8232 ECG') + ' · OUTPUT→5, LO+→6, LO−→7';
+    $('iNet').textContent = i.network + ' · http://' + i.ip;
     $('iOled').textContent = i.oled || '—';
-    $('iMl').textContent = i.mlCorrect + '/' + i.mlTotal + ' test beats correct · ' + i.mlUs + ' µs each · ' + i.mlKb + ' KB model (PTB ECG)';
+    if (i.phase === 2) {
+      if (!phase2) setPhase2(true);
+      $('iSensor').textContent = 'AD8232 ECG (5, LO+ 6, LO− 7) · Grove GSR (1) · ' + (i.imu || 'MPU-6050');
+      $('iMl').textContent = (i.model || 'stress model') + '. Tested on people it never saw (leave-one-person-out): accuracy ' +
+        pct(i.losoAcc) + ', F1 ' + (+i.losoF1).toFixed(2) + ', AUC ' + (+i.losoAuc).toFixed(3) + '.';
+      $('iSt').textContent = i.mlMatch + '/' + i.mlTotal + ' windows match Python · ' + i.mlCorrect + '/' + i.mlTotal +
+        ' right on ' + (i.stSubject || 'WESAD') + ' · ' + (i.mlUs / 1000).toFixed(1) + ' ms per window';
+      if (i.windows && i.windows.length) { windows = i.windows; renderReplayButtons(); }
+    } else {
+      $('iSensor').textContent = (i.sensor || 'AD8232 ECG') + ' · OUTPUT→5, LO+→6, LO−→7';
+      $('iMl').textContent = i.mlCorrect + '/' + i.mlTotal + ' test beats correct · ' + i.mlUs + ' µs each · ' + i.mlKb + ' KB model (PTB ECG)';
+    }
+  }
+  function renderReplayButtons(){
+    var box = $('replayBtns'); box.innerHTML = '';
+    var count = {};
+    windows.forEach(function(c, i){
+      count[c] = (count[c] || 0) + 1;
+      var b = document.createElement('button');
+      b.className = (c === 'stress' ? 'q-bad' : 'q-ok') + ' p2btn';
+      b.innerHTML = c.charAt(0).toUpperCase() + c.slice(1) + (c === 'stress' ? ' ' + count[c] : '') + '<small>60 s, real data</small>';
+      b.disabled = link !== 'connected';
+      b.addEventListener('click', function(){ command({type: 'replay', i: i}); });
+      box.appendChild(b);
+    });
   }
 
   /* ---------- rendering ---------- */
@@ -399,7 +566,7 @@
     pairCard.classList.remove('ok', 'bad');
     connectBtn.style.display = (unsupported || connected || link === 'connecting' || (link === 'lost' && retryTimer)) ? 'none' : 'block';
     connectBtn.textContent = link === 'lost' ? 'Reconnect via Bluetooth' : 'Connect via Bluetooth';
-    [sensorsToggle].concat(Array.prototype.slice.call(document.querySelectorAll('.quick button, #sendDemoBtn, #clearDemoBtn')))
+    [sensorsToggle, calmToggle].concat(Array.prototype.slice.call(document.querySelectorAll('.quick button, #sendDemoBtn, #clearDemoBtn, .p2btn')))
       .forEach(function(el){ el.disabled = !connected; });
 
     if (link === 'idle') {
@@ -415,6 +582,7 @@
                                        : 'Tap Reconnect. Is the suit switched on and nearby?';
       bpmEl.textContent = '--';
       statusEl.textContent = 'NOT CONNECTED'; statusEl.className = 'status off';
+      $('calmBox').style.display = 'none';
       banner.classList.remove('show'); document.body.classList.remove('banner-on');
     } else if (mine) {
       pairCard.classList.add('ok');
@@ -475,6 +643,7 @@
       shapeLine.style.display = 'none';
     }
     if (Date.now() > toggleBusyUntil) sensorsToggle.checked = !!s.sensorsOn;
+    if (phase2) applyStress(s);
 
     if (s.status === 'danger') {
       banner.textContent = '⚠ DANGER — ' + s.bpm + ' BPM · vibration alert active';
@@ -493,6 +662,49 @@
         if (s.status === 'normal' || s.status === 'danger') alertCheck(s);
       }
     }
+  }
+
+  /* ---------- Phase 2: stress, skin, movement, calibration ---------- */
+  function num(v, d){ return (typeof v === 'number' && v > 0) ? v.toFixed(d) : '--'; }
+  function applyStress(s){
+    var verdict = s.stress === 'calm' || s.stress === 'stress';
+    var q = STRESS[s.stress] || {text: s.stress || '—', cls: 'wait'};
+    var w = $('stressWord'); w.textContent = q.text; w.className = 'stress-word ' + q.cls;
+    $('stressPct').textContent = (verdict && s.stressP >= 0) ? s.stressP + ' %' : '';
+    $('meterFill').style.width = (s.stressP >= 0 ? s.stressP : 0) + '%';
+    $('stressNote').textContent = s.replay >= 0 ? 'Replay: WESAD ' + (windows[s.replay] || '') + ' window'
+                                : verdict ? (MODEL[s.model] || '') : (NOTE[s.stress] || '');
+    $('calmBox').style.display = s.calming ? 'block' : 'none';
+    $('replayTag').style.display = s.replay >= 0 ? 'inline-block' : 'none';
+    $('fHr').textContent = s.ecgOk ? num(s.hr, 0) : '--';
+    $('fRm').textContent = s.ecgOk ? num(s.rmssd, 0) : '--';
+    $('fGsr').textContent = (s.gsr > 0) ? s.gsr.toFixed(2) : 'off';
+    $('fMov').textContent = !s.imuOk ? 'no IMU' : (s.moving ? 'moving' : 'still');
+    if (Date.now() > calmBusyUntil) calmToggle.checked = !!s.calmOn;
+
+    var calibrating = s.stress === 'calibrating';
+    $('calBar').style.display = calibrating ? 'block' : 'none';
+    $('calFill').style.width = (s.calPct || 0) + '%';
+    $('calBtn').textContent = calibrating ? 'Calibrating… ' + (s.calPct || 0) + ' %' : 'Calibrate (3 min)';
+    $('calHint').textContent = calibrating ? 'Sit still and breathe normally…' :
+      s.base ? 'Baseline saved on the suit (' + (s.base === 3 ? 'heart + skin' : s.base === 1 ? 'heart only' : 'skin only') +
+               '). Recalibrate if you move the sensors or on a new day.' :
+      'Sit still for 3 minutes with the electrodes and the GSR on. The model compares everything to this rest baseline. It is saved on the suit.';
+
+    if (typeof s.stressSeq === 'number') {
+      if (lastStressSeq === null || s.stressSeq < lastStressSeq) lastStressSeq = s.stressSeq;
+      else if (s.stressSeq > lastStressSeq) { lastStressSeq = s.stressSeq; if (verdict) stressAlert(s); }
+    }
+  }
+  function stressAlert(s){
+    var st = s.stress === 'stress';
+    var title = st ? 'Stress detected (' + s.stressP + ' %)' + (s.calming ? ' — calming vibration started' : '')
+                   : 'Back to calm (' + Math.max(0, s.stressP) + ' %)';
+    toast(title, st ? 'danger' : 'ok');
+    if (!alertsOn) return;
+    if (navigator.vibrate) navigator.vibrate(st ? [400, 200, 400] : [90]);
+    if (st) { beep(520, 300, 0); beep(440, 400, 0.4); } else { beep(660, 120, 0); }
+    systemNotify('SereniSuit — ' + (st ? 'stress' : 'calm'), title);
   }
 
   /* ---------- alerts after a BPM check ---------- */
@@ -546,7 +758,8 @@
     if (window.isSecureContext && 'Notification' in window && Notification.permission === 'default') {
       Notification.requestPermission();
     }
-    alertHint.textContent = 'Banner, sound, vibration and system notifications after every BPM check.';
+    alertHint.textContent = phase2 ? 'Banner, sound, vibration and system notifications for heart checks and stress changes.'
+                                   : 'Banner, sound, vibration and system notifications after every BPM check.';
   });
 
   /* ---------- controls ---------- */
@@ -564,6 +777,21 @@
   $('sendDemoBtn').addEventListener('click', function(){ sendDemo(parseInt(demoInput.value, 10)); });
   demoInput.addEventListener('keydown', function(e){ if (e.key === 'Enter') sendDemo(parseInt(demoInput.value, 10)); });
   $('clearDemoBtn').addEventListener('click', function(){ command({type: 'demo', clear: true}); });
+
+  /* Phase 2 controls */
+  calmToggle.addEventListener('change', function(){
+    calmBusyUntil = Date.now() + 1500;
+    command({type: 'haptics', calm: calmToggle.checked});
+  });
+  $('calBtn').addEventListener('click', function(){
+    command({type: 'calibrate', start: true});
+    toast('Calibration started — sit still for 3 minutes', 'ok');
+  });
+  $('calClear').addEventListener('click', function(){ command({type: 'calibrate', clear: true}); });
+  Array.prototype.forEach.call(document.querySelectorAll('[data-test]'), function(b){
+    b.addEventListener('click', function(){ command({type: 'haptics', test: b.getAttribute('data-test')}); });
+  });
+  $('replayStop').addEventListener('click', function(){ command({type: 'replay', stop: true}); });
 
   function showUnsupported(why){
     unsupported = why;
@@ -583,6 +811,7 @@
 
   var why = unsupportedReason();
   if (why) showUnsupported(why);
+  renderReplayButtons();
   render();
 })();
 </script>
