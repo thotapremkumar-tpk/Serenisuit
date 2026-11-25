@@ -19,7 +19,8 @@
 
   Phase 2 firmware (phase2/firmware): heart rate + on-chip stress model
   (random forest trained on WESAD), skin conductance (Grove GSR), movement
-  (MPU-6050), personal calibration, calming vibration, WESAD replay demo.
+  (MPU-6050), personal calibration, calming vibration (one motor), WESAD
+  replay demo, and fake sensor inputs for presentations.
   With the older Demo 1 firmware the Phase 2 cards stay hidden and the page
   works exactly as before.
 
@@ -153,6 +154,16 @@
   .replay button{padding:9px 4px;line-height:1.25;font-size:13px;}
   .replay small{display:block;font-weight:500;font-size:11px;opacity:.8;}
   .tag{font-size:11px;padding:3px 9px;border-radius:999px;background:rgba(79,168,255,.15);color:var(--accent);font-weight:600;}
+  body.phase2 .p1only{display:none;}
+  .presets{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:12px;}
+  .presets button{padding:10px 4px;line-height:1.3;font-size:14px;}
+  .presets small{display:block;font-weight:500;font-size:11px;opacity:.8;}
+  .q-mid{background:rgba(79,168,255,.14);color:var(--accent);}
+  .slide{margin-top:14px;}
+  .slide .row{margin:0;}
+  .slide b{font-variant-numeric:tabular-nums;}
+  input[type=range]{width:100%;margin-top:8px;accent-color:var(--accent);}
+  .pill.demo{background:rgba(245,185,66,.15);color:var(--warn);}
 </style>
 </head>
 <body>
@@ -170,7 +181,8 @@
   </div>
 
   <div class="card p2">
-    <div class="top"><span class="label">Stress</span><span class="tag" id="replayTag" style="display:none;">WESAD REPLAY</span></div>
+    <div class="top"><span class="label">Stress</span><span><span class="pill demo" id="fakeTag" style="display:none;">DEMO INPUTS</span>
+      <span class="tag" id="replayTag" style="display:none;">WESAD REPLAY</span></span></div>
     <div class="stress-big"><span class="stress-word wait" id="stressWord">—</span><span class="stress-pct" id="stressPct"></span></div>
     <div class="meter"><i id="meterFill"></i><b></b></div>
     <div class="scale"><span>calm</span><span>threshold 50 %</span><span>stressed</span></div>
@@ -223,7 +235,7 @@
     <div class="row p2row" style="display:none;">
       <div>
         <div class="label">Calming vibration</div>
-        <div class="hint">Breathing pacer on the motors when stress is detected.</div>
+        <div class="hint">Breathing pacer on the motor when stress is detected.</div>
       </div>
       <label class="switch">
         <input type="checkbox" id="calmToggle" checked disabled>
@@ -240,12 +252,11 @@
   </div>
 
   <div class="card p2">
-    <div class="label">Motors</div>
-    <div class="hint">Test each motor, or feel the calming pattern for 20 s.</div>
+    <div class="label">Vibration motor</div>
+    <div class="hint">Test the motor, or feel the calming pattern for 20 s.</div>
     <div class="btns">
-      <button class="btn-ghost p2btn" data-test="a">Motor A</button>
-      <button class="btn-ghost p2btn" data-test="b">Motor B</button>
-      <button class="btn-ghost p2btn" data-test="calm">Calming</button>
+      <button class="btn-ghost p2btn" data-test="a">Test motor</button>
+      <button class="btn-ghost p2btn" data-test="calm">Calming pattern</button>
       <button class="btn-ghost p2btn" data-test="stop">Stop</button>
     </div>
   </div>
@@ -258,7 +269,46 @@
     <button class="btn-ghost full p2btn" id="replayStop">Back to live sensors</button>
   </div>
 
-  <div class="card">
+  <div class="card p2">
+    <div class="label">Demo — fake sensor inputs</div>
+    <div class="hint">For the presentation. These values replace the sensors and go through the suit's
+      <b>real</b> stress model and heart-rate alarm, exactly as if they had been measured.</div>
+    <div class="presets">
+      <button class="q-ok p2btn"  data-preset="calm">😌 Calm<small>72 BPM · 2.0 µS</small></button>
+      <button class="q-bad p2btn" data-preset="stress">😰 Stressed<small>92 BPM · 3.0 µS</small></button>
+      <button class="q-mid p2btn" data-preset="walk">🚶 Walking<small>model pauses</small></button>
+    </div>
+    <div class="slide">
+      <div class="row"><span class="label">Heart rate (ECG)</span><b id="vBpm">72 BPM</b></div>
+      <input type="range" class="p2btn" id="sBpm" min="40" max="160" step="1" value="72">
+      <div class="quick">
+        <button class="q-ok p2btn fquick"  data-fbpm="72">72<small>normal</small></button>
+        <button class="q-bad p2btn fquick" data-fbpm="45">45<small>too low</small></button>
+        <button class="q-bad p2btn fquick" data-fbpm="140">140<small>too high</small></button>
+      </div>
+      <div class="hint">60–100 BPM is normal. Outside it the suit shows DANGER and the motor buzzes.</div>
+    </div>
+    <div class="slide">
+      <div class="row"><span class="label">Skin conductance (GSR)</span><b id="vGsr">2.0 µS</b></div>
+      <input type="range" class="p2btn" id="sGsr" min="0.5" max="8" step="0.1" value="2.0">
+      <div class="hint">Resting level is 2.0 µS here. Sweating under stress raises it.</div>
+    </div>
+    <div class="row" style="margin-top:14px;">
+      <div><div class="label">Moving (MPU-6050)</div><div class="hint">Walking — the stress model pauses.</div></div>
+      <label class="switch"><input type="checkbox" class="p2btn" id="fMoving"><span class="slider"></span></label>
+    </div>
+    <div class="row">
+      <div><div class="label">ECG electrodes on</div><div class="hint">Off = "attach electrodes"; skin-only model.</div></div>
+      <label class="switch"><input type="checkbox" class="p2btn" id="fLeads" checked><span class="slider"></span></label>
+    </div>
+    <div class="row">
+      <div><div class="label">GSR on the skin</div><div class="hint">Off = heart-only model.</div></div>
+      <label class="switch"><input type="checkbox" class="p2btn" id="fSkin" checked><span class="slider"></span></label>
+    </div>
+    <button class="btn-ghost full p2btn" id="fakeClear">Back to live sensors</button>
+  </div>
+
+  <div class="card p1only">
     <div class="label" id="demoBpmTitle">Demo — fake BPM input</div>
     <div class="hint">Drives the suit exactly like a real reading. 60–100 is normal and is just shown.
       Outside that range the suit shows DANGER and vibrates.</div>
@@ -509,7 +559,9 @@
                 stress: b.ss, stressP: (b.sp === undefined ? -1 : b.sp), stressSeq: b.sq, gsr: b.g, moving: !!b.mv,
                 calPct: b.cp || 0, base: b.hb || 0, calming: !!b.cm, calmOn: b.co !== 0, replay: (b.rp === undefined ? -1 : b.rp),
                 hr: b.hr || 0, rmssd: b.rm || 0, ecgOk: !!b.eo, edaOk: !!b.go, imuOk: !!b.im,
-                model: (b.mi === undefined ? -1 : b.mi)});
+                model: (b.mi === undefined ? -1 : b.mi),
+                fake: !!((b.fk || 0) & 1), fakeMoving: !!((b.fk || 0) & 2), fakeLeads: !((b.fk || 0) & 4),
+                fakeSkin: !((b.fk || 0) & 8), fakeGsr: (b.fg === undefined ? 2 : b.fg), fakeBpm: b.b});
   }
   function setPhase2(on){
     phase2 = on;
@@ -518,7 +570,6 @@
     $('subLine').textContent = on ? 'Phase 2 over Bluetooth · heart (AD8232 ECG) · skin (Grove GSR) · movement (MPU-6050) · on-chip stress model'
                                   : 'Live heart rate over Bluetooth · from the suit\'s ECG (AD8232)';
     $('sensorsHint').textContent = on ? 'ECG, GSR and motion sensor on or off.' : 'Switch the suit\'s ECG sensor (AD8232) on or off.';
-    $('demoBpmTitle').textContent = on ? 'Demo — fake BPM input (Phase 1)' : 'Demo — fake BPM input';
     renderReplayButtons();
     render();
   }
@@ -676,6 +727,12 @@
                                 : verdict ? (MODEL[s.model] || '') : (NOTE[s.stress] || '');
     $('calmBox').style.display = s.calming ? 'block' : 'none';
     $('replayTag').style.display = s.replay >= 0 ? 'inline-block' : 'none';
+    $('fakeTag').style.display = s.fake ? 'inline-block' : 'none';
+    if (s.fake && Date.now() > fakeBusyUntil) {
+      if (s.fakeBpm > 0) $('sBpm').value = s.fakeBpm;
+      $('sGsr').value = s.fakeGsr; showFakeValues($('sBpm').value, s.fakeGsr);
+      $('fMoving').checked = s.fakeMoving; $('fLeads').checked = s.fakeLeads; $('fSkin').checked = s.fakeSkin;
+    }
     $('fHr').textContent = s.ecgOk ? num(s.hr, 0) : '--';
     $('fRm').textContent = s.ecgOk ? num(s.rmssd, 0) : '--';
     $('fGsr').textContent = (s.gsr > 0) ? s.gsr.toFixed(2) : 'off';
@@ -771,7 +828,7 @@
     if (isNaN(v) || v < 1 || v > 300) { toast('Enter a BPM between 1 and 300'); return; }
     command({type: 'demo', bpm: v});
   }
-  Array.prototype.forEach.call(document.querySelectorAll('.quick button'), function(b){
+  Array.prototype.forEach.call(document.querySelectorAll('.quick button[data-bpm]'), function(b){
     b.addEventListener('click', function(){ sendDemo(parseInt(b.getAttribute('data-bpm'), 10)); });
   });
   $('sendDemoBtn').addEventListener('click', function(){ sendDemo(parseInt(demoInput.value, 10)); });
@@ -792,6 +849,42 @@
     b.addEventListener('click', function(){ command({type: 'haptics', test: b.getAttribute('data-test')}); });
   });
   $('replayStop').addEventListener('click', function(){ command({type: 'replay', stop: true}); });
+
+  /* demo: fake sensor inputs (Phase 2 firmware) */
+  var fakeBusyUntil = 0;
+  var PRESETS = {
+    calm:   {bpm: 72, gsr: 2.0, moving: false, leads: true, skin: true},
+    stress: {bpm: 92, gsr: 3.0, moving: false, leads: true, skin: true},
+    walk:   {bpm: 95, gsr: 2.4, moving: true,  leads: true, skin: true}
+  };
+  function sendFake(obj){ fakeBusyUntil = Date.now() + 1500; obj.type = 'fake'; command(obj); }
+  function showFakeValues(bpm, gsr){
+    $('vBpm').textContent = bpm + ' BPM';
+    $('vGsr').textContent = (+gsr).toFixed(1) + ' µS';
+  }
+  Array.prototype.forEach.call(document.querySelectorAll('[data-preset]'), function(b){
+    b.addEventListener('click', function(){
+      var p = PRESETS[b.getAttribute('data-preset')];
+      $('sBpm').value = p.bpm; $('sGsr').value = p.gsr; showFakeValues(p.bpm, p.gsr);
+      $('fMoving').checked = p.moving; $('fLeads').checked = p.leads; $('fSkin').checked = p.skin;
+      sendFake({bpm: p.bpm, gsr: p.gsr, moving: p.moving, leads: p.leads, skin: p.skin});
+    });
+  });
+  Array.prototype.forEach.call(document.querySelectorAll('.fquick'), function(b){
+    b.addEventListener('click', function(){
+      var v = parseInt(b.getAttribute('data-fbpm'), 10);
+      $('sBpm').value = v; showFakeValues(v, $('sGsr').value);
+      sendFake({bpm: v});
+    });
+  });
+  $('sBpm').addEventListener('input', function(){ fakeBusyUntil = Date.now() + 1500; showFakeValues($('sBpm').value, $('sGsr').value); });
+  $('sGsr').addEventListener('input', function(){ fakeBusyUntil = Date.now() + 1500; showFakeValues($('sBpm').value, $('sGsr').value); });
+  $('sBpm').addEventListener('change', function(){ sendFake({bpm: parseInt($('sBpm').value, 10)}); });
+  $('sGsr').addEventListener('change', function(){ sendFake({gsr: parseFloat($('sGsr').value)}); });
+  $('fMoving').addEventListener('change', function(){ sendFake({moving: $('fMoving').checked}); });
+  $('fLeads').addEventListener('change', function(){ sendFake({leads: $('fLeads').checked}); });
+  $('fSkin').addEventListener('change', function(){ sendFake({skin: $('fSkin').checked}); });
+  $('fakeClear').addEventListener('click', function(){ command({type: 'fake', clear: true}); });
 
   function showUnsupported(why){
     unsupported = why;
