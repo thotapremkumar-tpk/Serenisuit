@@ -21,8 +21,8 @@
   (random forest trained on WESAD), skin conductance (Grove GSR), movement
   (MPU-6050), personal calibration, calming vibration (one motor), WESAD
   replay demo, and fake sensor inputs for presentations.
-  With the older Demo 1 firmware the Phase 2 cards stay hidden and the page
-  works exactly as before.
+  The Phase 2 cards show from the start; if the page connects to the older
+  Demo 1 firmware they hide and the page works exactly as before.
 
   Works in: Chrome or Edge on Mac / Windows / Linux / Android.
   Not in:   iPhone / iPad browsers (Apple has no Web Bluetooth) -> use the
@@ -383,7 +383,7 @@
   var devices = [], known = null;
   var lastState = null, lastCheckSeq = null, lastStressSeq = null;
   var alertsOn = false, audioCtx = null, toggleBusyUntil = 0, calmBusyUntil = 0;
-  var phase2 = false;                 // the suit runs the Phase 2 firmware (stress model)
+  var phase2 = false;                 // Phase 2 cards shown (default); hidden only for Demo 1 firmware
   var windows = ['stress', 'stress', 'stress', 'baseline', 'amusement', 'meditation'];
   var unsupported = '';              // set when this browser can't do Web Bluetooth
 
@@ -554,6 +554,7 @@
     //   rp replayed window, hr HR of the 60 s window, rm RMSSD, eo/go heart/skin window ok, im IMU found,
     //   mi model (0 heart+skin, 1 heart, 2 skin, -1 none)
     if (b.ss !== undefined && !phase2) setPhase2(true);
+    else if (b.ss === undefined && phase2) setPhase2(false);   // older Demo 1 firmware: hide Phase 2 cards
     applyState({status: b.s, bpm: b.b, sensorsOn: !!b.so, demoActive: !!b.da, checkSeq: b.q, paired: b.n,
                 shape: (b.sh === undefined ? -1 : b.sh), shapeN: b.sn || 0,
                 stress: b.ss, stressP: (b.sp === undefined ? -1 : b.sp), stressSeq: b.sq, gsr: b.g, moving: !!b.mv,
@@ -904,7 +905,7 @@
 
   var why = unsupportedReason();
   if (why) showUnsupported(why);
-  renderReplayButtons();
+  setPhase2(true);                    // the suit runs the Phase 2 firmware: show its cards from the start
   render();
 })();
 </script>

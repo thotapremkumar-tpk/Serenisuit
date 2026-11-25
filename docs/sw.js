@@ -2,7 +2,7 @@
  * Keeps a copy of the app so it opens with no internet at the venue (the suit
  * talks over Bluetooth, not the web), and lets the page show system
  * notifications. Bump CACHE when you change any file below. */
-const CACHE = 'serenisuit-bt-v3';
+const CACHE = 'serenisuit-bt-v4';
 const FILES = ['./', './index.html', './manifest.json', './icon.svg', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', (e) => {
